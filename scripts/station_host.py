@@ -46,6 +46,8 @@ WAKE_WORDS = [w.strip() for w in os.environ.get(
     "RBX_WAKE", "игорёчек,игоречек,игорёк,игорек,егорёк,егорек").split(",") if w.strip()]
 START_FRAMES, END_SILENCE_S, MIN_S, MAX_S = 5, 0.8, 0.7, 12.0
 TTS_FORMAT, TTS_RATE = "pcm_24000", 24000
+#: Потоковый синтез (SSE MiniMax): звук играет с первого куска, а не после всей фразы. 0 — целым куском (сравнение).
+TTS_STREAM = os.environ.get("RBX_TTS_STREAM", "1") != "0"
 
 
 def log(msg: str) -> None:
@@ -144,9 +146,16 @@ class Vad:
                 return b"".join(buf)
 
 
+def aplay_cmd(rate: int = TTS_RATE) -> list[str]:
+    return ["aplay", "-q", "-D", "default", "-f", "S16_LE", "-r", str(rate), "-c", "1", "-t", "raw"]
+
+
 def play(pcm: bytes, rate: int = TTS_RATE) -> None:
-    subprocess.run(["aplay", "-q", "-D", "default", "-f", "S16_LE", "-r", str(rate), "-c", "1", "-t", "raw"],
-                   input=pcm, check=False)
+    subprocess.run(aplay_cmd(rate), input=pcm, check=False)
+
+
+class _NoAudioYet(Exception):
+    """Поток TTS упал до первого куска звука — можно повторить целым синтезом, слушатель ничего не услышал."""
 
 
 class Voice:
@@ -163,21 +172,61 @@ class Voice:
         self.limited = False
 
     async def say(self, text: str, mic: Mic | None = None, on_sound=None) -> float:
-        t0 = time.time()
-        pcm = await self.tts.synthesize_bytes(text, format=TTS_FORMAT)
-        synth = time.time() - t0
-        if on_sound:
-            on_sound()  # звук пошёл: отсюда считается задержка, не от конца проигрывания
+        """Синтез и проигрывание; возвращает время до первого звука от начала синтеза."""
         if mic:
             mic.muted = True
         try:
-            await asyncio.to_thread(play, pcm)
+            if TTS_STREAM:
+                try:
+                    return await self._say_stream(text, on_sound)
+                except _NoAudioYet as exc:
+                    log(f"поток TTS не дал звука ({exc.__cause__!r}) — синтез целым куском")
+            return await self._say_whole(text, on_sound)
         finally:
             if mic:
                 await asyncio.sleep(0.3)  # хвост эха комнаты
                 mic.flush()
                 mic.muted = False
+
+    async def _say_whole(self, text: str, on_sound) -> float:
+        t0 = time.time()
+        pcm = await self.tts.synthesize_bytes(text, format=TTS_FORMAT)
+        synth = time.time() - t0
+        if on_sound:
+            on_sound()  # звук пошёл: отсюда считается задержка, не от конца проигрывания
+        await asyncio.to_thread(play, pcm)
         return synth
+
+    async def _say_stream(self, text: str, on_sound) -> float:
+        """Куски SSE пишутся в stdin ``aplay`` по мере прихода. Ошибка до первого куска — ``_NoAudioYet``."""
+        from rob_box_llm.tts import TTSFormat, TTSSettings  # noqa: PLC0415
+
+        t0 = time.time()
+        first = 0.0
+        proc: subprocess.Popen | None = None
+        settings = TTSSettings(format=TTSFormat.PCM, sample_rate=TTS_RATE)
+        try:
+            async for chunk in self.tts.stream(text, settings=settings):
+                if chunk.finish_reason == "error":
+                    log("поток TTS оборвался посреди фразы — остаток не прозвучит")
+                    break
+                if not chunk.samples:
+                    continue
+                if proc is None:
+                    first = time.time() - t0
+                    proc = subprocess.Popen(aplay_cmd(chunk.sample_rate or TTS_RATE), stdin=subprocess.PIPE)
+                    if on_sound:
+                        on_sound()
+                await asyncio.to_thread(proc.stdin.write, chunk.samples)
+        except Exception as exc:  # noqa: BLE001
+            if proc is None:
+                raise _NoAudioYet() from exc
+            log(f"поток TTS: {type(exc).__name__} посреди фразы")
+        finally:
+            if proc is not None:
+                proc.stdin.close()
+                await asyncio.to_thread(proc.wait)
+        return first
 
     def stt_limited(self) -> bool:
         """Последний отказ STT — лимит провайдера (429): без паузы шум съест квоту."""
@@ -260,7 +309,7 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
             for line in result.said:
                 started: list = []
                 synth = await voice.say(line, mic, on_sound=lambda: started.append(time.time()))
-                log(f"🔊 синтез {synth:.2f} с, от конца фразы до звука {started[0] - t1:.2f} с: «{line}»")
+                log(f"🔊 синтез до звука {synth:.2f} с, от конца фразы до звука {started[0] - t1:.2f} с: «{line}»")
     finally:
         mic.proc.kill()
         stand.close()

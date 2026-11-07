@@ -9,7 +9,7 @@ DIR=/data/opt/rbx
 LOG=/tmp/station.log
 PIDF=/tmp/rbx_host_loop.pid
 # Хост ждёт глушения Алисы: S99zzyandexoff спит 20 с и 30 с добивает quasar_launcher2/maind.
-DELAY=60
+DELAY=${DELAY:-60}
 
 loop() {
   echo $$ > "$PIDF"
