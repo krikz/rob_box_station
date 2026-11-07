@@ -11,6 +11,7 @@ LLM с мостом команд и исполнитель; владельцы, 
     python3.12 -X utf8 station_host.py                 # слушать и отвечать
     python3.12 -X utf8 station_host.py --say "текст"   # только синтез в динамик (проверка TTS)
     python3.12 -X utf8 station_host.py --selftest      # колонка говорит фразу и сама её распознаёт
+    python3.12 -X utf8 station_host.py --turn "Игорёк, который час?"  # один ход без микрофона, звук живой
 """
 from __future__ import annotations
 
@@ -48,6 +49,8 @@ START_FRAMES, END_SILENCE_S, MIN_S, MAX_S = 5, 0.8, 0.7, 12.0
 TTS_FORMAT, TTS_RATE = "pcm_24000", 24000
 #: Потоковый синтез (SSE MiniMax): звук играет с первого куска, а не после всей фразы. 0 — целым куском (сравнение).
 TTS_STREAM = os.environ.get("RBX_TTS_STREAM", "1") != "0"
+#: Earcon «услышал»: ``sound_pack/button_click.mp3`` робота → s16le 24 кГц моно (ffmpeg на ПК, mp3 колонка не играет).
+HEARD_PCM = BASE / "assets" / "heard.raw"
 
 
 def log(msg: str) -> None:
@@ -278,15 +281,37 @@ async def selftest(voice: Voice, phrase: str) -> None:
     log(f"STT за {time.time() - t0:.2f} с: «{text}»")
 
 
-async def serve(voice: Voice, args: argparse.Namespace) -> None:
+def make_stand(args: argparse.Namespace):
     import chat  # noqa: PLC0415
 
     t0 = time.time()
     cargs = chat.build_arg_parser().parse_args(["--wake-word"] + (["--db", args.db] if args.db else []))
     stand = chat.build_stand(cargs, Path(args.workdir))
     stand.wake = list(WAKE_WORDS)  # таблица вейков робота (wake_words.yaml) колонке не подходит
-    log(f"ядро готово за {time.time() - t0:.1f} с; слушаю (вейк: {', '.join(WAKE_WORDS)})")
+    log(f"ядро готово за {time.time() - t0:.1f} с (вейк: {', '.join(WAKE_WORDS)})")
+    return chat, stand
+
+
+async def one_turn(voice: Voice, args: argparse.Namespace) -> None:
+    """Один ход по тексту без микрофона, выходы живые (earcon, реплики по ходу) — проверка без голоса человека."""
+    chat, stand = make_stand(args)
+    live = LiveOut(stand, voice, None)
+    try:
+        t1 = time.time()
+        live.begin(t1)
+        result = await stand.hear(args.turn, chat.CONSOLE_VOICE, source=chat.SOURCE_VOICE)
+        log(f"ход {time.time() - t1:.2f} с, адресовано={result.addressed} ({result.reason}): {result.said}")
+        await live.drain()
+    finally:
+        live.close()
+        stand.close()
+
+
+async def serve(voice: Voice, args: argparse.Namespace) -> None:
+    chat, stand = make_stand(args)
+    log("слушаю")
     mic, vad = Mic(), Vad()
+    live = LiveOut(stand, voice, mic)
     try:
         while True:
             pcm = await asyncio.to_thread(vad.utterance, mic)
@@ -300,25 +325,90 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
                     await asyncio.sleep(20)
                     mic.flush()
                 continue
+            live.begin(t1)
             result = await stand.hear(text, chat.CONSOLE_VOICE, source=chat.SOURCE_VOICE)
             t3 = time.time()
             if not result.addressed:
                 log(f"… не адресовано ({result.reason})")
                 continue
             log(f"ход {t3 - t2:.2f} с: {result.said}")
-            for line in result.said:
-                started: list = []
-                synth = await voice.say(line, mic, on_sound=lambda: started.append(time.time()))
-                log(f"🔊 синтез до звука {synth:.2f} с, от конца фразы до звука {started[0] - t1:.2f} с: «{line}»")
+            await live.drain()
+            mic.flush()
     finally:
+        live.close()
         mic.proc.kill()
         stand.close()
+
+
+class LiveOut:
+    """Выходы хода — в динамик сразу, а не после хода, как у стенда консоли (его ``speech`` и ``stage`` только пишут).
+
+    * ``stage("addressed", "started")`` → earcon «услышал» (у робота ``EARCON_SOUNDS["heard"]`` = ``button_click``).
+    * ``speech.say`` → очередь проигрывателя: реплика-заглушка («Секунду, думаю») звучит, пока модель думает.
+
+    Обёртки — через ``functools.wraps``: ход сверяет сигнатуру портов (``turn._accepts`` по ``inspect.signature``).
+    """
+
+    def __init__(self, stand, voice: Voice, mic: Mic | None) -> None:
+        import functools  # noqa: PLC0415
+
+        self._voice, self._mic = voice, mic
+        self._queue: asyncio.Queue[str] = asyncio.Queue()
+        self._t1 = 0.0
+        self._player = asyncio.ensure_future(self._play())
+        stage, say = stand.ports.stage, stand.speech.say
+
+        @functools.wraps(stage)
+        def live_stage(turn_id, epoch, stage_name, status, *a, **kw):
+            if stage_name == "addressed" and status == "started":
+                self.earcon()
+            return stage(turn_id, epoch, stage_name, status, *a, **kw)
+
+        @functools.wraps(say)
+        def live_say(turn_id, epoch, text, voice_id):
+            ref = say(turn_id, epoch, text, voice_id)
+            if text and text.strip():
+                self._queue.put_nowait(text)
+            return ref
+
+        stand.ports.stage, stand.speech.say = live_stage, live_say
+
+    def begin(self, t1: float) -> None:
+        self._t1 = t1
+
+    def earcon(self) -> None:
+        try:
+            with open(HEARD_PCM, "rb") as pcm:
+                subprocess.Popen(aplay_cmd(TTS_RATE), stdin=pcm)
+            log(f"🔔 услышал, от конца фразы {time.time() - self._t1:.2f} с")
+        except OSError as exc:
+            log(f"earcon не сыграл: {exc}")
+
+    async def _play(self) -> None:
+        while True:
+            line = await self._queue.get()
+            try:
+                started: list = []
+                synth = await self._voice.say(line, self._mic, on_sound=lambda: started.append(time.time()))
+                gap = f"{started[0] - self._t1:.2f}" if started else "—"
+                log(f"🔊 синтез до звука {synth:.2f} с, от конца фразы до звука {gap} с: «{line}»")
+            except Exception as exc:  # noqa: BLE001
+                log(f"реплика не прозвучала ({type(exc).__name__}): «{line}»")
+            finally:
+                self._queue.task_done()
+
+    async def drain(self) -> None:
+        await self._queue.join()
+
+    def close(self) -> None:
+        self._player.cancel()
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--say", default="", help="только синтез текста в динамик")
     ap.add_argument("--selftest", nargs="?", const="Робот, который час?", default=None, help="фраза самопроверки")
+    ap.add_argument("--turn", default="", help="один ход по тексту (без микрофона), звук живой")
     ap.add_argument("--db", default="", help="постоянная e2e-память колонки")
     ap.add_argument("--workdir", default="/tmp/rbx_station", help="каталог стенда")
     args = ap.parse_args()
@@ -329,6 +419,8 @@ def main() -> int:
     voice = Voice()
     if args.say:
         log(f"синтез {asyncio.run(voice.say(args.say)):.2f} с")
+    elif args.turn:
+        asyncio.run(one_turn(voice, args))
     elif args.selftest is not None:
         asyncio.run(selftest(voice, args.selftest))
     else:
