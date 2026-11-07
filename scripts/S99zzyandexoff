@@ -1,0 +1,20 @@
+#!/bin/sh
+# Яндекс Станция Лайт: глушит стек Алисы (quasar_launcher2 + maind) после загрузки, пока есть маркер.
+# Вернуть Алису без перепрошивки: rm /data/opt/yandex_off && reboot.
+# Ставится в /etc/init.d/ (rootfs ro → remount rw), см. docs/runbooks/yandex-station-root.md.
+MARK=/data/opt/yandex_off
+LOG=/data/opt/yandex_off.log
+off() {
+  # quasar_launcher2 перезапускает свои задачи — сначала его, потом maind
+  for i in 1 2 3 4 5 6; do
+    killall quasar_launcher2 2>/dev/null
+    killall maind 2>/dev/null
+    sleep 5
+  done
+  echo "$(date) yandex off: $(ps | grep -cE 'quasar_launcher2|maind --' ) left" >> "$LOG"
+}
+case "$1" in
+  start) [ -f "$MARK" ] && ( sleep 20; off ) </dev/null >/dev/null 2>&1 & ;;
+  stop) ;;
+esac
+exit 0
