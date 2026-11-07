@@ -4,8 +4,8 @@
 Ход строит тот же стенд, что консоль (``scripts/dialogue/chat.py``): настоящие адресация (вейк «Робот»), Tier-1, цепочка
 LLM с мостом команд и исполнитель; владельцы, кроме речи, фейковые. Ядро грузится один раз, дальше процесс слушает.
 
-Звук — штатные ``arecord``/``aplay`` колонки: ``multi_capture`` отдаёт 48 кГц, 6 каналов (микрофоны 0–3, петля 4–5),
-берётся канал 0 и ресемплится в 16 кГц. Эхоподавления нет, поэтому полудуплекс: пока колонка говорит, микрофон
+Звук — штатные ``arecord``/``aplay`` колонки: микрофон ``plughw:0,1`` (PDM, ALSA отдаёт 16 кГц моно), громкость —
+``amixer sset Master`` при старте. Эхоподавления нет, поэтому полудуплекс: пока колонка говорит, микрофон
 не слушается. VAD — по энергии с плавающим порогом шума.
 
     python3.12 -X utf8 station_host.py                 # слушать и отвечать
@@ -15,7 +15,6 @@ LLM с мостом команд и исполнитель; владельцы, 
 from __future__ import annotations
 
 import argparse
-import array
 import asyncio
 import audioop  # в 3.12 ещё есть (удалён в 3.13); numpy на колонке нет
 import io
@@ -35,9 +34,11 @@ for sub in ("site", "core", "core/scripts/dialog", "core/scripts/dialogue"):
 for pkg in ("rob_box_core", "rob_box_dialog", "rob_box_harness", "rob_box_llm", "rob_box_voice", "rob_box_mcp_tools"):
     sys.path.insert(0, str(CORE / "src" / pkg))
 
-IN_RATE, IN_CH, RATE = 48000, 6, 16000
+RATE = 16000
 FRAME_S = 0.03
-FRAME_IN = int(IN_RATE * FRAME_S) * IN_CH * 2  # байт сырого кадра 30 мс
+FRAME_IN = int(RATE * FRAME_S) * 2  # байт кадра 30 мс, 16 кГц моно
+MIC_DEVICE = os.environ.get("RBX_MIC", "plughw:0,1")
+VOLUME = os.environ.get("RBX_VOLUME", "230")  # Master 0..255; заводские 153 (−20 дБ) — тихо
 START_FRAMES, END_SILENCE_S, MIN_S, MAX_S = 5, 0.8, 0.7, 12.0
 TTS_FORMAT, TTS_RATE = "pcm_24000", 24000
 
@@ -61,8 +62,10 @@ class Mic:
     ``arecord`` не переполняется (overrun). ``muted`` — кадры выбрасываются (полудуплекс)."""
 
     def __init__(self) -> None:
-        self.proc = subprocess.Popen(["arecord", "-q", "-D", "multi_capture", "-f", "S16_LE", "-r", str(IN_RATE),
-                                      "-c", str(IN_CH), "-t", "raw"], stdout=subprocess.PIPE, bufsize=0)
+        # plughw:0,1 — PDM-микрофоны; ALSA сама отдаёт 16 кГц моно (канал 0). Резать 6 каналов и ресемплить на Питоне
+        # нельзя: на A53 поток микрофона под GIL растягивал ход консоли с 3,6 до 22 с (замер 07.11).
+        self.proc = subprocess.Popen(["arecord", "-q", "-D", MIC_DEVICE, "-f", "S16_LE", "-r", str(RATE), "-c", "1",
+                                      "-t", "raw"], stdout=subprocess.PIPE, bufsize=0)
         self.state = None
         self.muted = False
         self.q: "queue.Queue[bytes]" = queue.Queue(maxsize=int(30 / FRAME_S))  # 30 с запаса
@@ -75,9 +78,7 @@ class Mic:
             if not chunk:
                 raise RuntimeError(f"arecord закрылся, код {self.proc.poll()}")
             raw += chunk
-        mono = array.array("h", raw)[0::IN_CH].tobytes()
-        out, self.state = audioop.ratecv(mono, 2, 1, IN_RATE, RATE, self.state)
-        return out
+        return raw
 
     def _pump(self) -> None:
         while True:
@@ -99,7 +100,9 @@ class Mic:
 
 
 class Vad:
-    """Реплика по энергии: порог = шум × 4, не ниже 150 (PDM Gain 0: свой динамик в микрофоне 200–350 RMS, шум 13–45), старт — 5 кадров из 10 выше порога, конец — 0,8 с тишины."""
+    """Реплика по энергии: порог = шум × 4, не ниже 150; старт — 5 кадров из 10 выше порога, конец — 0,8 с тишины.
+
+    Замер 07.11 (PDM Gain 0): шум 13–45 RMS, голос Шифу с метра — до ~200, свой динамик — 200–350."""
 
     def __init__(self) -> None:
         self.noise = 300.0
@@ -264,6 +267,7 @@ def main() -> int:
     os.makedirs(args.workdir, exist_ok=True)
     os.chdir(CORE)
     load_env()
+    subprocess.run(["amixer", "-q", "sset", "Master", VOLUME], check=False)
     voice = Voice()
     if args.say:
         log(f"синтез {asyncio.run(voice.say(args.say)):.2f} с")
