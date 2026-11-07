@@ -18,6 +18,20 @@ TTS → динамик. Границы и план — ADR-0167 в `krikz/rob_bo
 | Настройка Wi-Fi по Bluetooth, страница настроек | не начато (ADR-0167 Ш6) |
 | Ядро как пакет из `krikz/rob_box_dialog_core` по тегу | ждёт ADR-0167 Ш1–Ш2; сейчас файлы ядра льются из чекаута `rob_box_project` |
 
+## Установка одной строкой
+
+С компьютера (Linux, Mac, Git Bash), где есть SSH к колонке после рута
+([runbook](https://github.com/krikz/rob_box_project/blob/develop/docs/runbooks/yandex-station-root.md)):
+
+```bash
+curl -sL https://raw.githubusercontent.com/krikz/rob_box_station/main/install.sh | sh -s -- 10.1.1.13
+```
+
+Ставит Питон, библиотеки и ядро (ассет релиза `station-runtime-armv7.tar.gz`), код колонки последнего релиза,
+автозапуск, глушение Алисы, приветствие SSH. Потом — ключи на странице `http://<колонка>:8080`. Обновления —
+«Игорёк, проверь обновление» / «Игорёк, обновись». `DRY_RUN=1` — показать шаги без изменений.
+Нужен релиз с ассетом (`gh release create vX.Y.Z station-runtime-armv7.tar.gz`) — первый ещё не выпущен.
+
 ## Хендофф 07.11.2026 (что знать следующей сессии)
 
 **Замер задержки** (лог `/tmp/station.log`, 12:45 CET): STT 1,73 с + ход 3,73 с + синтез 2,74 с = 8,20 с от конца фразы
