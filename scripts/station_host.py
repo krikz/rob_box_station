@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import audioop  # в 3.12 ещё есть (удалён в 3.13); numpy на колонке нет
 import io
+import json
 import os
 import queue
 import subprocess
@@ -30,6 +31,13 @@ from pathlib import Path
 
 BASE = Path(os.environ.get("RBX_BASE", "/data/opt/rbx"))
 CORE = BASE / "core"
+#: Настройки со страницы (``station_setup``): ``RBX_*`` по умолчанию, окружение процесса важнее.
+SETTINGS = BASE / "settings.json"
+try:
+    for _k, _v in json.loads(SETTINGS.read_text(encoding="utf-8")).items():
+        os.environ.setdefault(str(_k), str(_v))
+except (OSError, ValueError):
+    pass
 for sub in ("site", "core", "core/scripts/dialog", "core/scripts/dialogue"):
     sys.path.insert(0, str(BASE / sub))
 for pkg in ("rob_box_core", "rob_box_dialog", "rob_box_harness", "rob_box_llm", "rob_box_voice", "rob_box_mcp_tools"):
@@ -388,6 +396,7 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
     live = LiveOut(stand, voice, mic, ring)
     buttons = Buttons(mic, ring, live)
     Keys(asyncio.get_running_loop(), buttons.on_key)
+    await start_setup(stand, mic, ring, buttons)
     try:
         while True:
             pcm = await asyncio.to_thread(vad.utterance, mic)
@@ -466,7 +475,7 @@ class LiveOut:
             if applied:
                 log(f"голос {applied!r} провайдера {provider} на колонке не играет — говорю MiniMax по умолчанию")
             return None
-        return applied or None
+        return applied or os.environ.get("RBX_VOICE") or None
 
     def begin(self, t1: float) -> None:
         self._t1 = t1
@@ -592,8 +601,8 @@ def click() -> None:
 class Buttons:
     """Кнопки: громкость ±, «микрофон выкл», кнопка Алисы (во время речи — стоп, иначе — слушать без вейка)."""
 
-    def __init__(self, mic: Mic, ring: Ring, live: LiveOut) -> None:
-        self._mic, self._ring, self._live = mic, ring, live
+    def __init__(self, mic: Mic, ring: Ring, live: LiveOut, auth=None) -> None:
+        self._mic, self._ring, self._live, self.auth = mic, ring, live, auth
         self.volume = int(VOLUME)
         self.armed_until = 0.0
 
@@ -618,6 +627,8 @@ class Buttons:
         log(f"🔘 громкость {self.volume}")
 
     def _action(self) -> None:
+        if self.auth is not None:
+            self.auth.grant()  # окно настройки: Improv по Bluetooth и страница
         if self._live.busy():
             self._live.stop()
             log("🔘 стоп: речь оборвана кнопкой")
@@ -653,6 +664,50 @@ class Buttons:
         if any(w in text.lower() for w in WAKE_WORDS):
             return text
         return f"Игорёк, {text}"
+
+
+async def start_setup(stand, mic: Mic, ring: Ring, buttons: "Buttons") -> None:
+    """Improv Wi-Fi по Bluetooth и страница настроек (``station_setup``); сбой одного не роняет хост."""
+    import station_setup as setup  # noqa: PLC0415
+
+    auth = setup.Auth()
+    buttons.auth = auth
+    for name, value in (("RBX_WAKE", ",".join(WAKE_WORDS)), ("RBX_VOLUME", VOLUME), ("RBX_LED", str(LED_BRIGHT))):
+        os.environ.setdefault(name, value)  # форма страницы показывает то, что сейчас в силе
+
+    def identify() -> None:
+        click()
+        ring.set("listen")
+        asyncio.get_running_loop().call_later(1.5, ring.idle)
+
+    def on_saved(new: dict, keys: list) -> None:
+        global LED_BRIGHT
+        os.environ.update(new)
+        WAKE_WORDS[:] = [w for w in new["RBX_WAKE"].split(",") if w]
+        stand.wake = list(WAKE_WORDS)
+        LED_BRIGHT = int(new["RBX_LED"])
+        buttons.volume = int(new["RBX_VOLUME"])
+        subprocess.run(["amixer", "-q", "sset", "Master", new["RBX_VOLUME"]], check=False)
+        ring.idle()
+        if keys:  # провайдеры собраны при старте — новые ключи берёт только новый процесс
+            asyncio.get_running_loop().call_later(1.0, restart_self, mic)
+
+    improv = setup.Improv(auth, identify, log)
+    try:
+        await improv.start()
+    except Exception as exc:  # noqa: BLE001
+        log(f"📶 Improv не поднялся: {type(exc).__name__}: {exc}")
+    try:
+        await setup.SettingsServer(SETTINGS, CORE / "scripts" / "dialogue" / ".env", auth, on_saved, log).start()
+    except OSError as exc:
+        log(f"⚙ страница настроек не поднялась: {exc}")
+
+
+def restart_self(mic: Mic) -> None:
+    """Перезапуск хоста тем же процессом (init-цикл не считает это падением): новые ключи из ``.env``."""
+    log("⚙ перезапуск хоста: сменились ключи")
+    mic.proc.kill()
+    os.execv(sys.executable, [sys.executable, "-X", "utf8", "-u"] + sys.argv)
 
 
 def main() -> int:
