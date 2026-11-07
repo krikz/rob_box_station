@@ -658,7 +658,7 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
                         live.speak(done or "Не смог скачать обновление, попробуй позже.")
                     await live.drain()
                     if done.startswith("Обновляюсь"):
-                        restart_self(mic)
+                        restart_self(mic, "обновление")
                     mic.flush()
                     continue
                 reply = await bt.handle(" ".join(words[1:]))
@@ -1082,7 +1082,8 @@ async def start_setup(stand, mic: Mic, ring: Ring, buttons: "Buttons") -> None:
     try:
         await setup.SettingsServer(SETTINGS, CORE / "scripts" / "dialogue" / ".env", auth, on_saved, log,
                                    prompts=station_prompts(setup),
-                                   on_prompt=lambda: asyncio.get_running_loop().call_later(1.0, restart_self, mic),
+                                   on_prompt=lambda: asyncio.get_running_loop().call_later(
+                                       1.0, restart_self, mic, "промпт"),
                                    on_wifi=lambda ok: wifi_done(ok, ring, mic)).start()
     except OSError as exc:
         log(f"⚙ страница настроек не поднялась: {exc}")
@@ -1092,7 +1093,7 @@ def wifi_done(ok: bool, ring: "Ring", mic: Mic) -> None:
     """Итог смены сети: кольцо цветом; удача — перезапуск, чтобы факты устройства взяли новый адрес."""
     ring.flash("speak" if ok else "muted")
     if ok:
-        asyncio.get_running_loop().call_later(4.0, restart_self, mic)
+        asyncio.get_running_loop().call_later(4.0, restart_self, mic, "сеть Wi-Fi")
 
 
 def station_prompts(setup):
@@ -1100,11 +1101,16 @@ def station_prompts(setup):
     return setup.Prompts(CORE / "src" / "rob_box_voice" / "prompts", BASE / "prompts")
 
 
-def restart_self(mic: Mic) -> None:
-    """Перезапуск хоста тем же процессом (init-цикл не считает это падением): новые ключи из ``.env``."""
-    log("⚙ перезапуск хоста: сменились ключи")
+#: Абсолютный путь хоста: ``main`` уходит в каталог ядра (``os.chdir(CORE)``), и относительный ``sys.argv[0]`` после
+#: ``execv`` не находился (07.11: rc=2, хост поднимал только init-цикл через 10 с).
+SELF = str(Path(__file__).resolve())
+
+
+def restart_self(mic: Mic, why: str = "сменились ключи") -> None:
+    """Перезапуск хоста тем же процессом (init-цикл не считает это падением): новые ключи, промпт, версия."""
+    log(f"⚙ перезапуск хоста: {why}")
     mic.proc.kill()
-    os.execv(sys.executable, [sys.executable, "-X", "utf8", "-u"] + sys.argv)
+    os.execv(sys.executable, [sys.executable, "-X", "utf8", "-u", SELF] + sys.argv[1:])
 
 
 def main() -> int:
