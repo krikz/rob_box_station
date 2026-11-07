@@ -174,40 +174,40 @@ class Voice:
             raise SystemExit("нет MINIMAX_API_KEY для STT")
         self.limited = False
 
-    async def say(self, text: str, mic: Mic | None = None, on_sound=None) -> float:
+    async def say(self, text: str, mic: Mic | None = None, on_sound=None, voice: str | None = None) -> float:
         """Синтез и проигрывание; возвращает время до первого звука от начала синтеза."""
         if mic:
             mic.muted = True
         try:
             if TTS_STREAM:
                 try:
-                    return await self._say_stream(text, on_sound)
+                    return await self._say_stream(text, on_sound, voice)
                 except _NoAudioYet as exc:
                     log(f"поток TTS не дал звука ({exc.__cause__!r}) — синтез целым куском")
-            return await self._say_whole(text, on_sound)
+            return await self._say_whole(text, on_sound, voice)
         finally:
             if mic:
                 await asyncio.sleep(0.3)  # хвост эха комнаты
                 mic.flush()
                 mic.muted = False
 
-    async def _say_whole(self, text: str, on_sound) -> float:
+    async def _say_whole(self, text: str, on_sound, voice: str | None = None) -> float:
         t0 = time.time()
-        pcm = await self.tts.synthesize_bytes(text, format=TTS_FORMAT)
+        pcm = await self.tts.synthesize_bytes(text, voice, format=TTS_FORMAT)
         synth = time.time() - t0
         if on_sound:
             on_sound()  # звук пошёл: отсюда считается задержка, не от конца проигрывания
         await asyncio.to_thread(play, pcm)
         return synth
 
-    async def _say_stream(self, text: str, on_sound) -> float:
+    async def _say_stream(self, text: str, on_sound, voice: str | None = None) -> float:
         """Куски SSE пишутся в stdin ``aplay`` по мере прихода. Ошибка до первого куска — ``_NoAudioYet``."""
         from rob_box_llm.tts import TTSFormat, TTSSettings  # noqa: PLC0415
 
         t0 = time.time()
         first = 0.0
         proc: subprocess.Popen | None = None
-        settings = TTSSettings(format=TTSFormat.PCM, sample_rate=TTS_RATE)
+        settings = TTSSettings(format=TTSFormat.PCM, sample_rate=TTS_RATE, voice=voice)
         try:
             async for chunk in self.tts.stream(text, settings=settings):
                 if chunk.finish_reason == "error":
@@ -353,7 +353,8 @@ class LiveOut:
         import functools  # noqa: PLC0415
 
         self._voice, self._mic = voice, mic
-        self._queue: asyncio.Queue[str] = asyncio.Queue()
+        self._queue: asyncio.Queue[tuple[str, str | None]] = asyncio.Queue()
+        self._stand = stand
         self._t1 = 0.0
         self._player = asyncio.ensure_future(self._play())
         stage, say = stand.ports.stage, stand.speech.say
@@ -368,10 +369,22 @@ class LiveOut:
         def live_say(turn_id, epoch, text, voice_id):
             ref = say(turn_id, epoch, text, voice_id)
             if text and text.strip():
-                self._queue.put_nowait(text)
+                self._queue.put_nowait((text, self.voice()))
             return ref
 
         stand.ports.stage, stand.speech.say = live_stage, live_say
+
+    def voice(self) -> str | None:
+        """Голос сессии (``set_voice`` хода) для MiniMax; ``None`` — голос провайдера по умолчанию.
+
+        Колонка говорит только MiniMax: голос Яндекса или Silero здесь не прозвучит — пишем в лог, говорим MiniMax."""
+        provider = getattr(self._stand, "voice_provider", "minimax")
+        applied = self._stand.session.snapshot.voice.applied
+        if provider != "minimax":
+            if applied:
+                log(f"голос {applied!r} провайдера {provider} на колонке не играет — говорю MiniMax по умолчанию")
+            return None
+        return applied or None
 
     def begin(self, t1: float) -> None:
         self._t1 = t1
@@ -386,12 +399,14 @@ class LiveOut:
 
     async def _play(self) -> None:
         while True:
-            line = await self._queue.get()
+            line, voice_id = await self._queue.get()
             try:
                 started: list = []
-                synth = await self._voice.say(line, self._mic, on_sound=lambda: started.append(time.time()))
+                synth = await self._voice.say(line, self._mic, on_sound=lambda: started.append(time.time()),
+                                              voice=voice_id)
                 gap = f"{started[0] - self._t1:.2f}" if started else "—"
-                log(f"🔊 синтез до звука {synth:.2f} с, от конца фразы до звука {gap} с: «{line}»")
+                log(f"🔊 синтез до звука {synth:.2f} с, от конца фразы до звука {gap} с, "
+                    f"голос {voice_id or '—'}: «{line}»")
             except Exception as exc:  # noqa: BLE001
                 log(f"реплика не прозвучала ({type(exc).__name__}): «{line}»")
             finally:
