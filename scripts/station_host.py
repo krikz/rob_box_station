@@ -157,10 +157,12 @@ class Voice:
             raise SystemExit("нет MINIMAX_API_KEY для STT")
         self.limited = False
 
-    async def say(self, text: str, mic: Mic | None = None) -> float:
+    async def say(self, text: str, mic: Mic | None = None, on_sound=None) -> float:
         t0 = time.time()
         pcm = await self.tts.synthesize_bytes(text, format=TTS_FORMAT)
         synth = time.time() - t0
+        if on_sound:
+            on_sound()  # звук пошёл: отсюда считается задержка, не от конца проигрывания
         if mic:
             mic.muted = True
         try:
@@ -250,8 +252,9 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
                 continue
             log(f"ход {t3 - t2:.2f} с: {result.said}")
             for line in result.said:
-                synth = await voice.say(line, mic)
-                log(f"🔊 синтез {synth:.2f} с, от конца фразы до звука {time.time() - t1:.2f} с: «{line}»")
+                started: list = []
+                synth = await voice.say(line, mic, on_sound=lambda: started.append(time.time()))
+                log(f"🔊 синтез {synth:.2f} с, от конца фразы до звука {started[0] - t1:.2f} с: «{line}»")
     finally:
         mic.proc.kill()
         stand.close()
