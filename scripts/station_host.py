@@ -38,7 +38,12 @@ RATE = 16000
 FRAME_S = 0.03
 FRAME_IN = int(RATE * FRAME_S) * 2  # байт кадра 30 мс, 16 кГц моно
 MIC_DEVICE = os.environ.get("RBX_MIC", "plughw:0,1")
-VOLUME = os.environ.get("RBX_VOLUME", "230")  # Master 0..255; заводские 153 (−20 дБ) — тихо
+VOLUME = os.environ.get("RBX_VOLUME", "230")
+#: Вейк колонки — свой, чтобы не отзываться вместе с роботом (Шифу 07.11: «пусть будет Игорёк»). Порядок важен:
+#: длинные формы первыми (матчинг по словам, как в wake_words.yaml робота). «Егорёк» — частое искажение STT.
+WAKE_WORDS = [w.strip() for w in os.environ.get(
+#: Вейк колонки — свой, чтобы не отзываться вместе с роботом (Шифу 07.11: «пусть будет Игорёк»).
+#: Порядок важен: длинные формы первыми (матчинг по словам, как в wake_words.yaml робота).
 START_FRAMES, END_SILENCE_S, MIN_S, MAX_S = 5, 0.8, 0.7, 12.0
 TTS_FORMAT, TTS_RATE = "pcm_24000", 24000
 
@@ -230,7 +235,8 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
     t0 = time.time()
     cargs = chat.build_arg_parser().parse_args(["--wake-word"] + (["--db", args.db] if args.db else []))
     stand = chat.build_stand(cargs, Path(args.workdir))
-    log(f"ядро готово за {time.time() - t0:.1f} с; слушаю (вейк «Робот»)")
+    stand.wake = list(WAKE_WORDS)  # таблица вейков робота (wake_words.yaml) колонке не подходит
+    log(f"ядро готово за {time.time() - t0:.1f} с; слушаю (вейк: {', '.join(WAKE_WORDS)})")
     mic, vad = Mic(), Vad()
     try:
         while True:
