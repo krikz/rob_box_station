@@ -51,8 +51,12 @@ VOLUME = os.environ.get("RBX_VOLUME", "230")
 #: Вейк колонки — свой, чтобы не отзываться вместе с роботом (Шифу 07.11: «пусть будет Игорёк»).
 #: Порядок важен: длинные формы первыми (матчинг по словам, как в wake_words.yaml робота).
 #: «Егорёк» — частое искажение STT (догадка, не замер).
+#: Вейк по умолчанию: формы имени и искажения STT из логов колонки 07.11 («Легарёк», «Игорёв»). «Игорь» и «Егорка» —
+#: нет: обычные имена, будут ложные срабатывания. Шифу 07.11: «игоряна побольше вариаций».
+WAKE_DEFAULT = ["игорёчек", "игоречек", "игорёша", "игореша", "игорюша", "игорёха", "игореха", "игорян", "игорёк",
+                "игорек", "игарёк", "игарек", "егорёк", "егорек", "легарёк", "легарек", "игорёв", "игорев"]
 WAKE_WORDS = [w.strip() for w in os.environ.get(
-    "RBX_WAKE", "игорёчек,игоречек,игорёк,игорек,егорёк,егорек").split(",") if w.strip()]
+    "RBX_WAKE", ",".join(WAKE_DEFAULT)).split(",") if w.strip()]
 START_FRAMES, END_SILENCE_S, MIN_S, MAX_S = 5, 0.8, 0.7, 12.0
 TTS_FORMAT, TTS_RATE = "pcm_24000", 24000
 #: Потоковый синтез (SSE MiniMax): звук играет с первого куска, а не после всей фразы. 0 — целым куском (сравнение).
@@ -482,7 +486,7 @@ def install_station_tools(stand) -> None:
         port = os.environ.get("RBX_HTTP_PORT", "8080")
         return True, {
             "device": "колонка (Яндекс Станция Лайт), не робот: не ездит, камеры и батареи нет",
-            "name": (WAKE_WORDS[2] if len(WAKE_WORDS) > 2 else WAKE_WORDS[0]).capitalize(),
+            "name": os.environ.get("RBX_NAME", "Игорёк"),
             "network": {"wifi_ssid": net["ssid"] or None, "ip_address": net["ip"] or None,
                         "settings_page": f"http://{net['ip']}:{port}/" if net["ip"] else None},
             "volume": f"{STATION_STATE['volume']} из 255", "microphone": "выключен кнопкой"
