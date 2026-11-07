@@ -363,7 +363,13 @@ def install_llm_hedge(hedge_s: float = HEDGE_S) -> None:
 def make_stand(args: argparse.Namespace):
     import chat  # noqa: PLC0415
 
+    import station_setup as setup  # noqa: PLC0415
+
     install_llm_hedge()
+    prompts = station_prompts(setup)
+    chat.dm.PROMPT_DIR = prompts.materialize(Path(args.workdir) / "prompt")  # основа колонки + дополнение
+    log(f"промпт: основа {'своя' if prompts.is_own() else 'ядра'}"
+        f"{', дополнение ' + str(len(prompts.extra().strip())) + ' знаков' if prompts.extra().strip() else ''}")
     t0 = time.time()
     cargs = chat.build_arg_parser().parse_args(["--wake-word"] + (["--db", args.db] if args.db else []))
     stand = chat.build_stand(cargs, Path(args.workdir))
@@ -554,6 +560,11 @@ class Ring:
     def idle(self) -> None:
         self.set("muted" if self._mic is not None and self._mic.user_muted else "off")
 
+    def flash(self, state: str, seconds: float = 3.0) -> None:
+        """Показать состояние цветом на время (итог смены Wi-Fi) и вернуть покой."""
+        self.set(state)
+        asyncio.get_running_loop().call_later(seconds, self.idle)
+
     def level(self, volume: int) -> None:
         """Громкость белым: 1–3 диода по уровню, через 1,2 с — обратно прежнее состояние."""
         lit = 1 + round(2 * (volume - VOL_MIN) / (VOL_MAX - VOL_MIN))
@@ -698,9 +709,17 @@ async def start_setup(stand, mic: Mic, ring: Ring, buttons: "Buttons") -> None:
     except Exception as exc:  # noqa: BLE001
         log(f"📶 Improv не поднялся: {type(exc).__name__}: {exc}")
     try:
-        await setup.SettingsServer(SETTINGS, CORE / "scripts" / "dialogue" / ".env", auth, on_saved, log).start()
+        await setup.SettingsServer(SETTINGS, CORE / "scripts" / "dialogue" / ".env", auth, on_saved, log,
+                                   prompts=station_prompts(setup),
+                                   on_prompt=lambda: asyncio.get_running_loop().call_later(1.0, restart_self, mic),
+                                   on_wifi=lambda ok: ring.flash("speak" if ok else "muted")).start()
     except OSError as exc:
         log(f"⚙ страница настроек не поднялась: {exc}")
+
+
+def station_prompts(setup):
+    """Промпт колонки: свои копии в ``BASE/prompts``, основа ядра — в его ``rob_box_voice/prompts``."""
+    return setup.Prompts(CORE / "src" / "rob_box_voice" / "prompts", BASE / "prompts")
 
 
 def restart_self(mic: Mic) -> None:

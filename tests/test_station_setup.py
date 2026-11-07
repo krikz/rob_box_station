@@ -80,3 +80,38 @@ def test_update_env_keeps_other_keys_and_skips_blank(tmp_path):
 def test_page_never_shows_full_keys():
     page = ss.render_page({"RBX_WAKE": "игорёк"}, {"DEEPSEEK_API_KEY": "sk-abcdef123456"})
     assert "sk-abcdef123456" not in page and "…3456" in page
+
+
+def test_prompts_own_copy_and_reset(tmp_path):
+    core, own = tmp_path / "core", tmp_path / "own"
+    core.mkdir()
+    (core / ss.Prompts.FILE).write_text("You are РОББОКС.\n", encoding="utf-8")
+    p = ss.Prompts(core, own)
+    assert p.base() == "You are РОББОКС.\n" and not p.is_own()
+    p.save("You are Игорёк.\r\n", "Говори коротко.", reset=False)
+    assert p.is_own() and p.base() == "You are Игорёк.\n"
+    assert p.effective().endswith("Говори коротко.\n") and "Игорёк" in p.effective()
+    assert (p.materialize(tmp_path / "out") / ss.Prompts.FILE).read_text(encoding="utf-8") == p.effective()
+    p.save("anything", "", reset=True)
+    assert not p.is_own() and p.effective() == "You are РОББОКС.\n"
+
+
+def test_prompt_equal_to_core_keeps_no_copy(tmp_path):
+    core = tmp_path / "core"
+    core.mkdir()
+    (core / ss.Prompts.FILE).write_text("base\n", encoding="utf-8")
+    p = ss.Prompts(core, tmp_path / "own")
+    p.save("base\n", "", reset=False)
+    assert not p.is_own()
+
+
+def test_empty_base_without_reset_is_refused(tmp_path):
+    with pytest.raises(ValueError):
+        ss.Prompts(tmp_path, tmp_path / "own").save("  ", "", reset=False)
+
+
+def test_scan_ssids_sorted_unique_no_hidden():
+    text = ("bssid / frequency / signal level / flags / ssid\n"
+            "aa\t2412\t-70\t[WPA2]\tROS2\nbb\t2437\t-40\t[WPA2]\tМастерская\ncc\t2412\t-50\t[WPA2]\tROS2\n"
+            "dd\t2412\t-30\t[WPA2]\t\n")
+    assert ss.scan_ssids(text) == ["Мастерская", "ROS2"]

@@ -7,7 +7,8 @@
   приоритетом выше прочих; старые не выключаются. Не подключилась за ``WIFI_WAIT_S`` — сеть удаляется, колонка
   возвращается в прежнюю сама.
 * **Страница настроек** ``http://<колонка>:8080/``: вейк, голос, громкость, яркость кольца, ключи LLM/TTS (видны
-  только последние 4 знака). Сохранение — только в окно после кнопки Алисы (как Improv): чужой в сети ключи не сменит.
+  только последние 4 знака), промпт (основа + дополнение колонки, свои копии — ``Prompts``), смена сети Wi-Fi (тем же
+  безопасным ``connect_wifi``). Сохранение — только в окно после кнопки Алисы (как Improv): чужой в сети не сменит.
 
 Чистые функции (разбор пакетов Improv, проверка настроек, форма) — без D-Bus, их гоняет ``tests/test_station_setup.py``.
 """
@@ -216,9 +217,88 @@ def mask(value: str) -> str:
     return "не задан" if not value else f"…{value[-4:]}"
 
 
-def render_page(settings: Dict[str, str], env: Dict[str, str], note: str = "") -> str:
+class Prompts:
+    """Промпт колонки: основа (свой файл или файл ядра) + дополнение колонки. Файлы ядра не правятся: свои копии —
+    в ``own_dir``; ход собирается из ``materialize`` (каталог, который хост отдаёт стенду как ``PROMPT_DIR``)."""
+
+    FILE, EXTRA = "master_prompt_compact.txt", "station_extra.txt"
+    MAX_CHARS = 20000
+
+    def __init__(self, core_dir: Path, own_dir: Path) -> None:
+        self.core_dir, self.own_dir = core_dir, own_dir
+
+    def _read(self, path: Path) -> str:
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+
+    def core(self) -> str:
+        return self._read(self.core_dir / self.FILE)
+
+    def is_own(self) -> bool:
+        return (self.own_dir / self.FILE).exists()
+
+    def base(self) -> str:
+        return self._read(self.own_dir / self.FILE) if self.is_own() else self.core()
+
+    def extra(self) -> str:
+        return self._read(self.own_dir / self.EXTRA)
+
+    def effective(self) -> str:
+        extra = self.extra().strip()
+        return self.base().rstrip() + ("\n\n# STATION (колонка «Игорёк»)\n" + extra + "\n" if extra else "\n")
+
+    def materialize(self, out_dir: Path) -> Path:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / self.FILE).write_text(self.effective(), encoding="utf-8")
+        return out_dir
+
+    def save(self, base: str, extra: str, reset: bool) -> str:
+        """Записать основу (совпала с ядром или ``reset`` — своя копия удаляется) и дополнение; итог словами."""
+        base, extra = base.replace("\r\n", "\n"), extra.replace("\r\n", "\n")
+        if len(base) > self.MAX_CHARS or len(extra) > self.MAX_CHARS:
+            raise ValueError(f"промпт длиннее {self.MAX_CHARS} знаков")
+        if not reset and not base.strip():
+            raise ValueError("основа промпта пустая — отметь «вернуть промпт ядра», если нужен он")
+        self.own_dir.mkdir(parents=True, exist_ok=True)
+        own = self.own_dir / self.FILE
+        if reset or base.strip() == self.core().strip():
+            own.unlink(missing_ok=True)
+            kind = "основа — ядра"
+        else:
+            own.write_text(base, encoding="utf-8")
+            kind = "основа — своя"
+        (self.own_dir / self.EXTRA).write_text(extra, encoding="utf-8")
+        return f"{kind}, дополнение {len(extra.strip())} знаков"
+
+
+def scan_ssids(text: str) -> List[str]:
+    """``wpa_cli scan_results`` → имена сетей по силе сигнала, без повторов и скрытых."""
+    rows = []
+    for line in text.splitlines()[1:]:
+        parts = line.split("\t")
+        if len(parts) >= 5 and parts[4].strip() and parts[2].lstrip("-").isdigit():
+            rows.append((int(parts[2]), parts[4]))
+    seen: List[str] = []
+    for _level, ssid in sorted(rows, reverse=True):
+        if ssid not in seen:
+            seen.append(ssid)
+    return seen
+
+
+STYLE = """body{font:16px system-ui;margin:0 auto;max-width:560px;padding:16px;background:#f6f6f4;color:#222}
+label{display:block;margin:12px 0}input,select,textarea{display:block;width:100%;box-sizing:border-box;padding:8px;
+font:inherit;margin-top:4px}textarea{font:13px ui-monospace,monospace;min-height:10em}button{padding:10px 16px;
+font:inherit}.note{background:#fff3c4;padding:8px}small{color:#666}h2{margin-top:28px}
+.check{display:flex;gap:8px;align-items:center}.check input{width:auto;display:inline}
+@media(prefers-color-scheme:dark){body{background:#1b1b1b;color:#eee}.note{background:#4a4020}small{color:#aaa}}"""
+
+
+def render_page(settings: Dict[str, str], env: Dict[str, str], note: str = "", prompts: Optional[Prompts] = None,
+                wifi: Optional[Dict[str, object]] = None) -> str:
     def field(label: str, name: str, value: str, kind: str = "text") -> str:
-        return (f'<label>{label}<input name="{name}" type="{kind}" value="{html.escape(value)}"></label>')
+        return f'<label>{label}<input name="{name}" type="{kind}" value="{html.escape(value)}"></label>'
 
     voices = "".join(f'<option value="{html.escape(k)}"{" selected" if k == settings.get("RBX_VOICE", "") else ""}>'
                      f"{html.escape(v)}</option>" for k, v in VOICES.items())
@@ -226,33 +306,56 @@ def render_page(settings: Dict[str, str], env: Dict[str, str], note: str = "") -
                    f'<input name="{k}" type="password" placeholder="пусто — не менять" autocomplete="off"></label>'
                    for k in KEY_NAMES)
     msg = f'<p class="note">{html.escape(note)}</p>' if note else ""
+    prompt_form = ""
+    if prompts is not None:
+        whose = "своя (правлена здесь)" if prompts.is_own() else "из ядра"
+        prompt_form = f"""<h2>Промпт</h2><form method="post" action="/prompt">
+<label>Дополнение для колонки <small>дописывается в конец системного промпта: имя, характер, правила колонки</small>
+<textarea name="extra" rows="8">{html.escape(prompts.extra())}</textarea></label>
+<label>Основа системного промпта <small>сейчас {whose}; код ядра дописывает к ней свои разделы</small>
+<textarea name="base" rows="18">{html.escape(prompts.base())}</textarea></label>
+<label class="check"><input type="checkbox" name="reset" value="1">вернуть основу ядра</label>
+<button type="submit">Сохранить промпт</button> <small>колонка перезапустится (~10 с)</small></form>"""
+    wifi_form = ""
+    if wifi is not None:
+        nets = "".join(f'<option value="{html.escape(s)}">' for s in wifi.get("nets", []))
+        last = f"<p><small>последняя попытка: {html.escape(str(wifi['last']))}</small></p>" if wifi.get("last") else ""
+        wifi_form = f"""<h2>Wi-Fi</h2><p>Сейчас: <b>{html.escape(str(wifi.get("ssid") or "нет сети"))}</b>
+<small>{html.escape(str(wifi.get("ip") or ""))}</small></p>{last}<form method="post" action="/wifi">
+<label>Сеть<input name="ssid" list="nets" autocomplete="off"><datalist id="nets">{nets}</datalist></label>
+<label>Пароль<input name="password" type="password" autocomplete="off"></label>
+<button type="submit">Подключить</button> <small>старая сеть не забывается: не вышло за 30 с — колонка вернётся в
+неё; кольцо мигнёт зелёным (вышло) или красным (нет)</small></form>"""
     return f"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Колонка Игорёк</title>
-<style>body{{font:16px system-ui;margin:0 auto;max-width:520px;padding:16px;background:#f6f6f4;color:#222}}
-label{{display:block;margin:12px 0}}input,select{{display:block;width:100%;box-sizing:border-box;padding:8px;
-font:inherit;margin-top:4px}}button{{padding:10px 16px;font:inherit}}.note{{background:#fff3c4;padding:8px}}
-small{{color:#666}}@media(prefers-color-scheme:dark){{body{{background:#1b1b1b;color:#eee}}
-.note{{background:#4a4020}}}}</style></head><body><h1>Колонка «Игорёк»</h1>{msg}
-<p>Сначала нажми кнопку Алисы на колонке, потом «Сохранить» (минута на сохранение).</p>
-<form method="post" action="/save">
+<style>{STYLE}</style></head><body><h1>Колонка «Игорёк»</h1>{msg}
+<p>Чтобы сохранить что-либо: нажми кнопку Алисы на колонке, потом кнопку на странице (на это минута).</p>
+<h2>Основное</h2><form method="post" action="/save">
 {field("Вейк-слова (через запятую)", "wake", settings.get("RBX_WAKE", ""))}
 <label>Голос<select name="voice">{voices}</select></label>
 {field("Громкость (60–255)", "volume", settings.get("RBX_VOLUME", "230"), "number")}
 {field("Яркость кольца (0–255)", "led", settings.get("RBX_LED", "60"), "number")}
-<h2>Ключи</h2>{keys}
-<button type="submit">Сохранить</button></form></body></html>"""
+<h3>Ключи</h3>{keys}
+<button type="submit">Сохранить</button></form>{prompt_form}{wifi_form}</body></html>"""
 
 
 # ---------------------------------------------------------------- HTTP
 
 
 class SettingsServer:
-    """Страница настроек: ``GET /`` — форма, ``POST /save`` — проверка, запись, ``on_saved`` (хост применяет)."""
+    """Страница настроек: ``GET /`` — формы; ``POST /save`` (основное), ``/prompt`` (промпт), ``/wifi`` (сеть).
+    Любая запись — только в окно после кнопки Алисы (``Auth``)."""
+
+    BODY_MAX = 262144  # промпт кириллицей в urlencoded раздувается ×6
 
     def __init__(self, settings_path: Path, env_path: Path, auth: Auth,
-                 on_saved: Callable[[Dict[str, str], List[str]], None], log) -> None:
+                 on_saved: Callable[[Dict[str, str], List[str]], None], log, prompts: Optional[Prompts] = None,
+                 on_prompt: Optional[Callable[[], None]] = None,
+                 on_wifi: Optional[Callable[[bool], None]] = None) -> None:
         self.settings_path, self.env_path, self.auth = settings_path, env_path, auth
         self.on_saved, self.log = on_saved, log
+        self.prompts, self.on_prompt, self.on_wifi = prompts, on_prompt, on_wifi
+        self.wifi_last = ""
 
     async def start(self) -> None:
         await asyncio.start_server(self._client, "0.0.0.0", HTTP_PORT)
@@ -266,9 +369,9 @@ class SettingsServer:
             headers = {k.lower(): v.strip() for k, v in (h.split(":", 1) for h in lines[1:] if ":" in h)}
             body = b""
             size = int(headers.get("content-length", "0") or 0)
-            if 0 < size <= 16384:
-                body = await asyncio.wait_for(reader.readexactly(size), 10)
-            status, page = self._handle(method, target, body)
+            if 0 < size <= self.BODY_MAX:
+                body = await asyncio.wait_for(reader.readexactly(size), 20)
+            status, page = await self._handle(method, target, body)
         except (asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError, asyncio.LimitOverrunError):
             status, page = "400 Bad Request", "bad request"
         data = page.encode("utf-8")
@@ -279,26 +382,67 @@ class SettingsServer:
         finally:
             writer.close()
 
-    def _handle(self, method: str, target: str, body: bytes) -> Tuple[str, str]:
+    async def _wifi_info(self) -> Dict[str, object]:
+        status = wpa_status(await wpa("status"))
+        nets = scan_ssids(await wpa("scan_results"))
+        asyncio.ensure_future(wpa("scan"))  # к следующему открытию страницы список свежее
+        return {"ssid": status.get("ssid", ""), "ip": status.get("ip_address", ""), "nets": nets,
+                "last": self.wifi_last}
+
+    async def _page(self, note: str = "") -> str:
         current = {k: os.environ.get(k, "") for k in ("RBX_WAKE", "RBX_VOLUME", "RBX_LED", "RBX_VOICE")}
-        settings, env = {**current, **load_settings(self.settings_path)}, read_env(self.env_path)
+        settings = {**current, **load_settings(self.settings_path)}
+        return render_page(settings, read_env(self.env_path), note, self.prompts, await self._wifi_info())
+
+    async def _handle(self, method: str, target: str, body: bytes) -> Tuple[str, str]:
         if method == "GET" and target.split("?")[0] == "/":
-            return "200 OK", render_page(settings, env)
-        if method != "POST" or target != "/save":
+            return "200 OK", await self._page()
+        if method != "POST" or target not in ("/save", "/prompt", "/wifi"):
             return "404 Not Found", "not found"
         form = {k: v[0] for k, v in urllib.parse.parse_qs(body.decode("utf-8"), keep_blank_values=True).items()}
         if not self.auth.ok():
-            return "403 Forbidden", render_page(settings, env, "Не сохранено: нажми кнопку Алисы на колонке и повтори.")
+            return "403 Forbidden", await self._page("Не сохранено: нажми кнопку Алисы на колонке и повтори.")
         try:
-            new = check_settings(form)
+            note = {"/save": self._save, "/prompt": self._prompt, "/wifi": self._wifi}[target](form)
         except ValueError as exc:
-            return "400 Bad Request", render_page(settings, env, f"Не сохранено: {exc}")
+            return "400 Bad Request", await self._page(f"Не сохранено: {exc}")
+        return "200 OK", await self._page(note)
+
+    def _save(self, form: Dict[str, str]) -> str:
+        new = check_settings(form)
         self.settings_path.write_text(json.dumps(new, ensure_ascii=False, indent=1), encoding="utf-8")
         keys = update_env(self.env_path, form)
         self.log(f"⚙ настройки сохранены со страницы; ключи: {', '.join(keys) or 'без изменений'}")
         self.on_saved(new, keys)
-        return "200 OK", render_page(new, read_env(self.env_path),
-                                     "Сохранено." + (" Ключи сменились — перезапускаюсь." if keys else ""))
+        return "Сохранено." + (" Ключи сменились — перезапускаюсь." if keys else "")
+
+    def _prompt(self, form: Dict[str, str]) -> str:
+        if self.prompts is None:
+            raise ValueError("промпт здесь не настраивается")
+        done = self.prompts.save(form.get("base", ""), form.get("extra", ""), form.get("reset") == "1")
+        self.log(f"⚙ промпт сохранён со страницы: {done}")
+        if self.on_prompt:
+            self.on_prompt()
+        return f"Промпт сохранён ({done}). Колонка перезапускается — обнови страницу через 15 с."
+
+    def _wifi(self, form: Dict[str, str]) -> str:
+        ssid, password = form.get("ssid", "").strip(), form.get("password", "")
+        if not ssid:
+            raise ValueError("не указана сеть")
+        if password:
+            psk_value(password)  # проверка до подключения
+        asyncio.ensure_future(self._connect(ssid, password))
+        return f"Подключаюсь к «{ssid}». Если выйдет — страница будет по новому адресу (его скажет лог и роутер)."
+
+    async def _connect(self, ssid: str, password: str) -> None:
+        try:
+            ip = await connect_wifi(ssid, password, self.log)
+        except ValueError as exc:
+            self.log(f"📶 {exc}")
+            ip = None
+        self.wifi_last = f"«{ssid}»: " + (f"подключилась, {ip}" if ip else "не вышло, осталась в прежней сети")
+        if self.on_wifi:
+            self.on_wifi(ip is not None)
 
 
 # ---------------------------------------------------------------- Improv по BLE (BlueZ D-Bus)
