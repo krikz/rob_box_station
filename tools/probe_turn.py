@@ -79,6 +79,8 @@ async def main() -> None:
             llm = sum(c["s"] for c in CALLS)
             print(f"«{phrase}» ход {total:.2f} с = LLM {llm:.2f} с + ядро {total - llm:.2f} с; "
                   f"запросов {len(CALLS)}; сказал {res.said}")
+            if os.environ.get("RBX_PROBE_LOG") == "1":
+                print("   ЛОГ ХОДА:\n" + res.log)
             for c in CALLS:
                 print(f"   {c['s']:.2f} с {c['model']} prompt={c['prompt']} cache_hit={c['cache_hit']} "
                       f"out={c['out']} символов: сообщения {c['chars']}, тулы {c['tools_chars']}")

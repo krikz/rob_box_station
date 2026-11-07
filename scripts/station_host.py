@@ -54,6 +54,14 @@ HEARD_PCM = BASE / "assets" / "heard.raw"
 #: Хедж запроса LLM: DeepSeek на тот же промпт отвечает то за 2 с, то за 12 с (замер 07.11, ~4 из 15 запросов
 #: 6–12 с). Не ответил за столько секунд — тот же запрос уходит второй раз, берётся первый ответ. 0 — выключено.
 HEDGE_S = float(os.environ.get("RBX_HEDGE_S", "4"))
+#: Кнопки колонки (замер 07.11, нажатия Шифу): event0 — «микрофон выкл», event1 (сенсорные) — громкость и кнопка Алисы.
+KEY_MUTE, KEY_VOL_DOWN, KEY_VOL_UP, KEY_ACTION = 113, 114, 115, 582
+#: Сенсорные кнопки срабатывают парой (Алиса + громкость минус в одну метку времени): второе нажатие в окне — шум.
+KEY_GUARD_S = 0.15
+VOL_MIN, VOL_MAX, VOL_STEP = 60, 255, 25
+#: Кнопка Алисы без речи: следующая фраза в это окно адресована колонке без вейка.
+ARM_S = 8.0
+LED_BRIGHT = int(os.environ.get("RBX_LED", "60"))
 
 
 def log(msg: str) -> None:
@@ -81,6 +89,7 @@ class Mic:
                                       "-t", "raw"], stdout=subprocess.PIPE, bufsize=0)
         self.state = None
         self.muted = False
+        self.user_muted = False  # кнопка «микрофон выкл»: кадры не идут в VAD, пока не включат
         self.q: "queue.Queue[bytes]" = queue.Queue(maxsize=int(30 / FRAME_S))  # 30 с запаса
         threading.Thread(target=self._pump, daemon=True).start()
 
@@ -96,7 +105,7 @@ class Mic:
     def _pump(self) -> None:
         while True:
             fr = self._read()
-            if self.muted:
+            if self.muted or self.user_muted:
                 continue
             try:
                 self.q.put_nowait(fr)
@@ -176,9 +185,18 @@ class Voice:
         if self.stt is None:
             raise SystemExit("нет MINIMAX_API_KEY для STT")
         self.limited = False
+        self.proc: subprocess.Popen | None = None  # текущий aplay речи — его глушит кнопка
+        self.cut = False
+
+    def stop(self) -> None:
+        """Кнопка: оборвать текущую реплику (aplay убить, поток синтеза бросить)."""
+        self.cut = True
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.kill()
 
     async def say(self, text: str, mic: Mic | None = None, on_sound=None, voice: str | None = None) -> float:
         """Синтез и проигрывание; возвращает время до первого звука от начала синтеза."""
+        self.cut = False
         if mic:
             mic.muted = True
         try:
@@ -198,9 +216,12 @@ class Voice:
         t0 = time.time()
         pcm = await self.tts.synthesize_bytes(text, voice, format=TTS_FORMAT)
         synth = time.time() - t0
+        if self.cut:
+            return synth
         if on_sound:
             on_sound()  # звук пошёл: отсюда считается задержка, не от конца проигрывания
-        await asyncio.to_thread(play, pcm)
+        self.proc = subprocess.Popen(aplay_cmd(), stdin=subprocess.PIPE)
+        await asyncio.to_thread(self.proc.communicate, pcm)
         return synth
 
     async def _say_stream(self, text: str, on_sound, voice: str | None = None) -> float:
@@ -216,21 +237,27 @@ class Voice:
                 if chunk.finish_reason == "error":
                     log("поток TTS оборвался посреди фразы — остаток не прозвучит")
                     break
+                if self.cut:
+                    break
                 if not chunk.samples:
                     continue
                 if proc is None:
                     first = time.time() - t0
-                    proc = subprocess.Popen(aplay_cmd(chunk.sample_rate or TTS_RATE), stdin=subprocess.PIPE)
+                    proc = self.proc = subprocess.Popen(aplay_cmd(chunk.sample_rate or TTS_RATE), stdin=subprocess.PIPE)
                     if on_sound:
                         on_sound()
                 await asyncio.to_thread(proc.stdin.write, chunk.samples)
         except Exception as exc:  # noqa: BLE001
             if proc is None:
                 raise _NoAudioYet() from exc
-            log(f"поток TTS: {type(exc).__name__} посреди фразы")
+            if not self.cut:
+                log(f"поток TTS: {type(exc).__name__} посреди фразы")
         finally:
             if proc is not None:
-                proc.stdin.close()
+                try:
+                    proc.stdin.close()
+                except BrokenPipeError:
+                    pass  # aplay убит кнопкой
                 await asyncio.to_thread(proc.wait)
         return first
 
@@ -356,7 +383,11 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
     chat, stand = make_stand(args)
     log("слушаю")
     mic, vad = Mic(), Vad()
-    live = LiveOut(stand, voice, mic)
+    ring = Ring(mic)
+    ring.idle()
+    live = LiveOut(stand, voice, mic, ring)
+    buttons = Buttons(mic, ring, live)
+    Keys(asyncio.get_running_loop(), buttons.on_key)
     try:
         while True:
             pcm = await asyncio.to_thread(vad.utterance, mic)
@@ -370,12 +401,16 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
                     await asyncio.sleep(20)
                     mic.flush()
                 continue
+            text = buttons.address(text)
             live.begin(t1)
             result = await stand.hear(text, chat.CONSOLE_VOICE, source=chat.SOURCE_VOICE)
             t3 = time.time()
             if not result.addressed:
                 log(f"… не адресовано ({result.reason})")
                 continue
+            for line in result.log.splitlines():
+                if any(k in line for k in ("violation", "bad_", "repair", "rejected", "fields_dropped")):
+                    log(f"   ядро: {line[:300]}")
             log(f"ход {t3 - t2:.2f} с: {result.said}")
             await live.drain()
             mic.flush()
@@ -394,10 +429,10 @@ class LiveOut:
     Обёртки — через ``functools.wraps``: ход сверяет сигнатуру портов (``turn._accepts`` по ``inspect.signature``).
     """
 
-    def __init__(self, stand, voice: Voice, mic: Mic | None) -> None:
+    def __init__(self, stand, voice: Voice, mic: Mic | None, ring: "Ring | None" = None) -> None:
         import functools  # noqa: PLC0415
 
-        self._voice, self._mic = voice, mic
+        self._voice, self._mic, self._ring = voice, mic, ring
         self._queue: asyncio.Queue[tuple[str, str | None]] = asyncio.Queue()
         self._stand = stand
         self._t1 = 0.0
@@ -408,6 +443,8 @@ class LiveOut:
         def live_stage(turn_id, epoch, stage_name, status, *a, **kw):
             if stage_name == "addressed" and status == "started":
                 self.earcon()
+                if self._ring:
+                    self._ring.set("think")
             return stage(turn_id, epoch, stage_name, status, *a, **kw)
 
         @functools.wraps(say)
@@ -445,6 +482,8 @@ class LiveOut:
     async def _play(self) -> None:
         while True:
             line, voice_id = await self._queue.get()
+            if self._ring:
+                self._ring.set("speak")
             try:
                 started: list = []
                 synth = await self._voice.say(line, self._mic, on_sound=lambda: started.append(time.time()),
@@ -456,12 +495,152 @@ class LiveOut:
                 log(f"реплика не прозвучала ({type(exc).__name__}): «{line}»")
             finally:
                 self._queue.task_done()
+                if self._ring and self._queue.empty():
+                    self._ring.idle()
+
+    def busy(self) -> bool:
+        return not self._queue.empty() or (self._voice.proc is not None and self._voice.proc.poll() is None)
+
+    def stop(self) -> None:
+        """Кнопка Алисы во время речи: оборвать реплику и всё, что стоит в очереди."""
+        while not self._queue.empty():
+            self._queue.get_nowait()
+            self._queue.task_done()
+        self._voice.stop()
 
     async def drain(self) -> None:
         await self._queue.join()
 
     def close(self) -> None:
         self._player.cancel()
+
+
+class Ring:
+    """Кольцо из трёх RGB-диодов (``/sys/class/leds/micro:{red,green,blue}:ring{1,2,3}``): состояние колонки цветом."""
+
+    COLORS = {"off": (0, 0, 0), "listen": (0, 0, 1), "think": (1, 0, 1), "speak": (0, 1, 0), "muted": (1, 0, 0)}
+
+    def __init__(self, mic: Mic | None) -> None:
+        self._mic = mic
+        self.state = "off"
+        self._warned = False
+
+    def _write(self, rgb: tuple, lit: int = 3) -> None:
+        for i in (1, 2, 3):
+            for color, on in zip(("red", "green", "blue"), rgb):
+                value = LED_BRIGHT if on and i <= lit else 0
+                try:
+                    with open(f"/sys/class/leds/micro:{color}:ring{i}/brightness", "w") as led:
+                        led.write(str(value))
+                except OSError as exc:
+                    if not self._warned:
+                        log(f"LED недоступны: {exc}")
+                        self._warned = True
+                    return
+
+    def set(self, state: str) -> None:
+        self.state = state
+        self._write(self.COLORS[state])
+
+    def idle(self) -> None:
+        self.set("muted" if self._mic is not None and self._mic.user_muted else "off")
+
+    def level(self, volume: int) -> None:
+        """Громкость белым: 1–3 диода по уровню, через 1,2 с — обратно прежнее состояние."""
+        lit = 1 + round(2 * (volume - VOL_MIN) / (VOL_MAX - VOL_MIN))
+        self._write((1, 1, 1), lit)
+        state = self.state
+        asyncio.get_running_loop().call_later(1.2, lambda: self.set(state) if self.state == state else None)
+
+
+class Keys:
+    """Кнопки колонки: поток читает ``/dev/input/event0,1`` и отдаёт код нажатия в цикл asyncio."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, handler) -> None:
+        self._loop, self._handler = loop, handler
+        self._last = 0.0
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self) -> None:
+        import select  # noqa: PLC0415
+        import struct  # noqa: PLC0415
+
+        fds = [os.open(f"/dev/input/event{i}", os.O_RDONLY) for i in (0, 1)]
+        while True:
+            ready, _, _ = select.select(fds, [], [])
+            for fd in ready:
+                data = os.read(fd, 16 * 16)
+                for off in range(0, len(data) - 15, 16):
+                    _sec, _usec, typ, code, value = struct.unpack_from("IIHHi", data, off)  # input_event armhf
+                    if typ == 1 and value == 1:
+                        self._press(code)
+
+    def _press(self, code: int) -> None:
+        now = time.monotonic()
+        if now - self._last < KEY_GUARD_S:
+            return  # пара сенсорных кнопок в одну метку — второе нажатие не считаем
+        self._last = now
+        self._loop.call_soon_threadsafe(self._handler, code)
+
+
+def click() -> None:
+    """Короткий щелчок (тот же звук, что «услышал») — отклик кнопки."""
+    with open(HEARD_PCM, "rb") as pcm:
+        subprocess.Popen(aplay_cmd(TTS_RATE), stdin=pcm)
+
+
+class Buttons:
+    """Кнопки: громкость ±, «микрофон выкл», кнопка Алисы (во время речи — стоп, иначе — слушать без вейка)."""
+
+    def __init__(self, mic: Mic, ring: Ring, live: LiveOut) -> None:
+        self._mic, self._ring, self._live = mic, ring, live
+        self.volume = int(VOLUME)
+        self.armed_until = 0.0
+
+    def on_key(self, code: int) -> None:
+        if code in (KEY_VOL_UP, KEY_VOL_DOWN):
+            self._volume(VOL_STEP if code == KEY_VOL_UP else -VOL_STEP)
+        elif code == KEY_MUTE:
+            self._mic.user_muted = not self._mic.user_muted
+            self._mic.flush()
+            if not self._live.busy():
+                self._ring.idle()
+            log(f"🔘 микрофон {'выключен' if self._mic.user_muted else 'включён'}")
+        elif code == KEY_ACTION:
+            self._action()
+
+    def _volume(self, step: int) -> None:
+        self.volume = max(VOL_MIN, min(VOL_MAX, self.volume + step))
+        subprocess.run(["amixer", "-q", "sset", "Master", str(self.volume)], check=False)
+        self._ring.level(self.volume)
+        if not self._live.busy():
+            click()
+        log(f"🔘 громкость {self.volume}")
+
+    def _action(self) -> None:
+        if self._live.busy():
+            self._live.stop()
+            log("🔘 стоп: речь оборвана кнопкой")
+        elif not self._mic.user_muted:
+            self.armed_until = time.time() + ARM_S
+            self._mic.flush()
+            click()
+            self._ring.set("listen")
+            asyncio.get_running_loop().call_later(ARM_S, self._disarm)
+            log(f"🔘 слушаю без вейка {ARM_S:.0f} с")
+
+    def _disarm(self) -> None:
+        if time.time() >= self.armed_until and self._ring.state == "listen":
+            self._ring.idle()
+
+    def address(self, text: str) -> str:
+        """Фраза после кнопки Алисы адресована колонке: без вейка код подставляет его сам."""
+        if not text or time.time() >= self.armed_until:
+            return text
+        self.armed_until = 0.0
+        if any(w in text.lower() for w in WAKE_WORDS):
+            return text
+        return f"Игорёк, {text}"
 
 
 def main() -> int:
