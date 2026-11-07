@@ -43,11 +43,20 @@ ssh -p 2222 root@10.1.1.13 'kill $(pidof python3.12); killall arecord'
 ssh -p 2222 root@10.1.1.13 'grep -E "🎤|ход [0-9]|🔊|429|Error" /tmp/station.log | tail'
 ```
 
+**Автозапуск** (`scripts/S99zzzrbxhost`): после загрузки ждёт 60 с, пока `S99zzyandexoff` заглушит Алису, и держит
+хост в цикле — при падении рестарт с паузой 10 с × номер попытки (потолок 5 мин). Прошлый лог — `/tmp/station.log.1`.
+Работает, пока есть маркер `/data/opt/rbx_host`. Установка:
+
+```bash
+ssh -p 2222 root@10.1.1.13 'mount -o remount,rw / && cat > /etc/init.d/S99zzzrbxhost && chmod +x /etc/init.d/S99zzzrbxhost && sync && mount -o remount,ro / && touch /data/opt/rbx_host' < scripts/S99zzzrbxhost
+ssh -p 2222 root@10.1.1.13 '/etc/init.d/S99zzzrbxhost restart'   # без перезагрузки; stop — погасить до следующей
+```
+
 `RBX_DEBUG=1` — уровни VAD раз в 3 с. Ключи — `/data/opt/rbx/core/scripts/dialogue/.env` (0600), их в git нет.
 
 **Следующие шаги (совет — по порядку):**
 
-1. Автозапуск хоста: init-скрипт `S99zzrbxhost` рядом с `S99zzyandexoff` (rootfs `remount,rw`), рестарт при падении.
+1. Автозапуск хоста: init-скрипт `S99zzzrbxhost` (выше) — написан 07.11, на колонке не проверен.
 2. Потоковый синтез MiniMax — первый звук ~1 с вместо 2,7 (догадка).
 3. Контекст хода колонки без фона мастерской; затем Yandex STT (поток, нет 429).
 4. Кнопки (`/dev/input/event0`, `event1`) → громкость, пауза, «стоп»; кольцо LED `micro:{red,green,blue}:ring{1,2,3}` →

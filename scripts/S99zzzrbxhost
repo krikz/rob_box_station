@@ -1,0 +1,46 @@
+#!/bin/sh
+# Яндекс Станция Лайт: автозапуск хоста колонки (station_host.py) после загрузки, рестарт при падении.
+# Идёт после S99zzyandexoff (имя сортируется позже): ждёт, пока тот заглушит Алису и освободит микрофон.
+# Выключить автозапуск: rm /data/opt/rbx_host && /etc/init.d/S99zzzrbxhost stop.
+# Ставится в /etc/init.d/ (rootfs ro → remount rw), команда — README, раздел «Автозапуск».
+MARK=/data/opt/rbx_host
+PY=/data/opt/python/bin/python3.12
+DIR=/data/opt/rbx
+LOG=/tmp/station.log
+PIDF=/tmp/rbx_host_loop.pid
+# Хост ждёт глушения Алисы: S99zzyandexoff спит 20 с и 30 с добивает quasar_launcher2/maind.
+DELAY=60
+
+loop() {
+  echo $$ > "$PIDF"
+  sleep "$DELAY"
+  n=0
+  while [ -f "$MARK" ] && [ "$(cat "$PIDF" 2>/dev/null)" = "$$" ]; do
+    n=$((n + 1))
+    [ -f "$LOG" ] && mv -f "$LOG" "$LOG.1"
+    echo "$(date) rbxhost: старт #$n" > "$LOG"
+    cd "$DIR" && TZ=CET-1 "$PY" -X utf8 -u station_host.py --db "$DIR/station_memory.db" >> "$LOG" 2>&1 < /dev/null
+    rc=$?
+    echo "$(date) rbxhost: выход rc=$rc" >> "$LOG"
+    killall arecord aplay 2>/dev/null
+    # Частые падения подряд (нет сети, битые ключи) — не молотить облако: пауза растёт до 5 мин.
+    s=$((n * 10)); [ "$s" -gt 300 ] && s=300
+    sleep "$s"
+  done
+  rm -f "$PIDF"
+}
+
+case "$1" in
+  start)
+    [ -f "$MARK" ] && ( loop ) < /dev/null > /dev/null 2>&1 &
+    ;;
+  stop)
+    rm -f "$PIDF"
+    kill $(pidof python3.12) 2>/dev/null
+    killall arecord aplay 2>/dev/null
+    ;;
+  restart)
+    "$0" stop; sleep 2; DELAY=0 "$0" start
+    ;;
+esac
+exit 0
