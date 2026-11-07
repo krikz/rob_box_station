@@ -49,5 +49,7 @@ def test_install_refuses_without_space(tmp_path, monkeypatch):
 
 
 def test_update_command_words():
-    assert su.is_update_command("проверь обновление") and su.is_update_command("обновись")
-    assert not su.is_update_command("обнови прогноз погоды")
+    assert su.update_command("проверь обновление") == "check"
+    assert su.update_command("есть ли обновления") == "check"
+    assert su.update_command("обновись") == "install"
+    assert su.update_command("обнови прогноз погоды") == ""

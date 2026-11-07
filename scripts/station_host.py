@@ -649,12 +649,14 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
             live.begin(t1)
             words = text.split()
             if words and words[0].lower().strip(",.!?") in WAKE_WORDS:
-                if station_update.is_update_command(" ".join(words[1:])):  # обновление: решает код
+                command = station_update.update_command(" ".join(words[1:]))
+                if command:  # обновление: решает код; «проверь» — только рассказать, «обновись» — поставить
                     live.earcon()
                     tag, phrase = await asyncio.to_thread(updater.latest)
-                    live.speak(phrase)
-                    done = await asyncio.to_thread(updater.install, tag) if tag else ""
-                    if tag:
+                    live.speak(phrase + (" Скажи «Игорёк, обновись», чтобы поставить." if tag and command == "check"
+                                         else ""))
+                    done = await asyncio.to_thread(updater.install, tag) if tag and command == "install" else ""
+                    if tag and command == "install":
                         live.speak(done or "Не смог скачать обновление, попробуй позже.")
                     await live.drain()
                     if done.startswith("Обновляюсь"):

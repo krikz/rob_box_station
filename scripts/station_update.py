@@ -64,7 +64,21 @@ class Updater:
         newest = max(names, key=lambda n: [int(x) if x.isdigit() else 0 for x in n[1:].split(".")])
         if newest == self.current():
             return None, f"Обновлений нет, у меня последняя версия {newest}."
-        return newest, f"Есть новая версия {newest}, у меня {self.current()}."
+        notes = self.notes(newest)
+        return newest, (f"Есть новая версия {newest}, у меня {self.current()}."
+                        + (f" Что нового: {notes}" if notes else ""))
+
+    def notes(self, tag: str) -> str:
+        """«Что нового» — описание аннотированного тега (пишется для людей, Шифу 07.11); нет — пусто."""
+        try:
+            ref = json.loads(_get(f"https://api.github.com/repos/{REPO}/git/ref/tags/{tag}", self.token()))
+            if ref.get("object", {}).get("type") != "tag":
+                return ""
+            obj = json.loads(_get(ref["object"]["url"], self.token()))
+            return " ".join(str(obj.get("message", "")).split())[:400]
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"⬆ описание {tag} не прочитано: {type(exc).__name__}")
+            return ""
 
     def install(self, tag: str) -> str:
         """Скачать тег, отложить старое в ``prev/``, поставить новое, взвести сторожа отката."""
@@ -111,6 +125,12 @@ class Updater:
                          stderr=subprocess.DEVNULL, start_new_session=True)
 
 
-def is_update_command(text: str) -> bool:
+def update_command(text: str) -> str:
+    """«проверь обновление» → ``check`` (сказать, что нового, не ставить); «обновись» → ``install``; иначе ``""``.
+    Шифу 07.11: сначала Игорёк проверяет и рассказывает, что нового, ставит — по отдельной просьбе."""
     low = text.lower().replace("ё", "е")
-    return "обнов" in low and any(w in low for w in ("провер", "обновись", "обновляйся", "есть ли", "поставь"))
+    if "обнов" not in low:
+        return ""
+    if any(w in low for w in ("обновись", "обновляйся", "поставь обновлен", "установи обновлен", "обнови себя")):
+        return "install"
+    return "check" if any(w in low for w in ("провер", "есть ли", "какие", "что нового")) else ""
