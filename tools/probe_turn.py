@@ -59,6 +59,9 @@ async def _timed(self, *a, **kw):
 
 occ.AsyncCompletions.create = _timed
 
+if os.environ.get("RBX_PC") != "1":
+    sh.install_llm_hedge()  # RBX_HEDGE_S=0 — без хеджа
+
 
 async def main() -> None:
     db = os.environ.get("RBX_DB", "")

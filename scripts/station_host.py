@@ -51,6 +51,9 @@ TTS_FORMAT, TTS_RATE = "pcm_24000", 24000
 TTS_STREAM = os.environ.get("RBX_TTS_STREAM", "1") != "0"
 #: Earcon «услышал»: ``sound_pack/button_click.mp3`` робота → s16le 24 кГц моно (ffmpeg на ПК, mp3 колонка не играет).
 HEARD_PCM = BASE / "assets" / "heard.raw"
+#: Хедж запроса LLM: DeepSeek на тот же промпт отвечает то за 2 с, то за 12 с (замер 07.11, ~4 из 15 запросов
+#: 6–12 с). Не ответил за столько секунд — тот же запрос уходит второй раз, берётся первый ответ. 0 — выключено.
+HEDGE_S = float(os.environ.get("RBX_HEDGE_S", "4"))
 
 
 def log(msg: str) -> None:
@@ -281,9 +284,51 @@ async def selftest(voice: Voice, phrase: str) -> None:
     log(f"STT за {time.time() - t0:.2f} с: «{text}»")
 
 
+def install_llm_hedge(hedge_s: float = HEDGE_S) -> None:
+    """Хедж ``DeepSeekProvider.complete``: молчит дольше ``hedge_s`` — второй такой же запрос, берётся первый ответ.
+
+    Отказ одного из двух ждёт второго; отказ обоих — исключение первого (как без хеджа). Проигравший отменяется.
+    TODO: место хеджу — ядро (``rob_box_llm``), там он поможет и роботу; здесь — пока ядро не вынесено (ADR-0167).
+    """
+    if hedge_s <= 0:
+        return
+    from rob_box_llm.providers.deepseek import DeepSeekProvider  # noqa: PLC0415
+
+    orig = DeepSeekProvider.complete
+    if getattr(orig, "_rbx_hedged", False):
+        return
+
+    async def hedged(self, *a, **kw):
+        t0 = time.time()
+        first = asyncio.ensure_future(orig(self, *a, **kw))
+        done, _ = await asyncio.wait({first}, timeout=hedge_s)
+        if done:
+            return first.result()
+        second = asyncio.ensure_future(orig(self, *a, **kw))
+        pending = {first, second}
+        error: BaseException | None = None
+        try:
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    if task.exception() is None:
+                        who = "первый" if task is first else "второй"
+                        log(f"⏱ LLM хедж: ответил {who} запрос, {time.time() - t0:.2f} с")
+                        return task.result()
+                    error = error or task.exception()
+            raise error
+        finally:
+            for task in pending:
+                task.cancel()
+
+    hedged._rbx_hedged = True
+    DeepSeekProvider.complete = hedged
+
+
 def make_stand(args: argparse.Namespace):
     import chat  # noqa: PLC0415
 
+    install_llm_hedge()
     t0 = time.time()
     cargs = chat.build_arg_parser().parse_args(["--wake-word"] + (["--db", args.db] if args.db else []))
     stand = chat.build_stand(cargs, Path(args.workdir))
