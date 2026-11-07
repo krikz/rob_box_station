@@ -614,7 +614,7 @@ class Buttons:
         subprocess.run(["amixer", "-q", "sset", "Master", str(self.volume)], check=False)
         self._ring.level(self.volume)
         if not self._live.busy():
-            click()
+            self._click()
         log(f"🔘 громкость {self.volume}")
 
     def _action(self) -> None:
@@ -623,11 +623,23 @@ class Buttons:
             log("🔘 стоп: речь оборвана кнопкой")
         elif not self._mic.user_muted:
             self.armed_until = time.time() + ARM_S
-            self._mic.flush()
-            click()
+            self._click()
             self._ring.set("listen")
             asyncio.get_running_loop().call_later(ARM_S, self._disarm)
             log(f"🔘 слушаю без вейка {ARM_S:.0f} с")
+
+    def _click(self) -> None:
+        """Щелчок отклика при заглушённом микрофоне: свой звук не должен уйти в VAD и облачный STT (07.11: каждый
+        щелчок давал пустое распознавание)."""
+        self._mic.muted = True
+        click()
+
+        def unmute() -> None:
+            self._mic.flush()
+            if not self._live.busy():
+                self._mic.muted = False
+
+        asyncio.get_running_loop().call_later(0.5, unmute)
 
     def _disarm(self) -> None:
         if time.time() >= self.armed_until and self._ring.state == "listen":
