@@ -20,6 +20,7 @@ import asyncio
 import audioop  # в 3.12 ещё есть (удалён в 3.13); numpy на колонке нет
 import io
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -37,7 +38,7 @@ for pkg in ("rob_box_core", "rob_box_dialog", "rob_box_harness", "rob_box_llm", 
 IN_RATE, IN_CH, RATE = 48000, 6, 16000
 FRAME_S = 0.03
 FRAME_IN = int(IN_RATE * FRAME_S) * IN_CH * 2  # байт сырого кадра 30 мс
-START_FRAMES, END_SILENCE_S, MIN_S, MAX_S = 3, 0.8, 0.4, 12.0
+START_FRAMES, END_SILENCE_S, MIN_S, MAX_S = 5, 0.8, 0.7, 12.0
 TTS_FORMAT, TTS_RATE = "pcm_24000", 24000
 
 
@@ -56,15 +57,18 @@ def wav_bytes(pcm: bytes, rate: int = RATE) -> bytes:
 
 
 class Mic:
-    """Поток кадров 30 мс, 16 кГц моно, канал 0 ``multi_capture``; ``muted`` — кадры выбрасываются (полудуплекс)."""
+    """Кадры 30 мс, 16 кГц моно, канал 0 ``multi_capture``. Читает отдельный поток в очередь: пока ход ждёт STT или LLM,
+    ``arecord`` не переполняется (overrun). ``muted`` — кадры выбрасываются (полудуплекс)."""
 
     def __init__(self) -> None:
         self.proc = subprocess.Popen(["arecord", "-q", "-D", "multi_capture", "-f", "S16_LE", "-r", str(IN_RATE),
                                       "-c", str(IN_CH), "-t", "raw"], stdout=subprocess.PIPE, bufsize=0)
         self.state = None
         self.muted = False
+        self.q: "queue.Queue[bytes]" = queue.Queue(maxsize=int(30 / FRAME_S))  # 30 с запаса
+        threading.Thread(target=self._pump, daemon=True).start()
 
-    def frame(self) -> bytes:
+    def _read(self) -> bytes:
         raw = b""
         while len(raw) < FRAME_IN:
             chunk = self.proc.stdout.read(FRAME_IN - len(raw))
@@ -75,27 +79,54 @@ class Mic:
         out, self.state = audioop.ratecv(mono, 2, 1, IN_RATE, RATE, self.state)
         return out
 
+    def _pump(self) -> None:
+        while True:
+            fr = self._read()
+            if self.muted:
+                continue
+            try:
+                self.q.put_nowait(fr)
+            except queue.Full:
+                self.q.get_nowait()
+                self.q.put_nowait(fr)
+
+    def flush(self) -> None:
+        while not self.q.empty():
+            self.q.get_nowait()
+
+    def frame(self) -> bytes:
+        return self.q.get()
+
 
 class Vad:
-    """Реплика по энергии: порог = шум × 3 (не ниже 300), конец — 0,8 с тишины."""
+    """Реплика по энергии: порог = шум × 4, не ниже 150 (PDM Gain 0: свой динамик в микрофоне 200–350 RMS, шум 13–45), старт — 5 кадров из 10 выше порога, конец — 0,8 с тишины."""
 
     def __init__(self) -> None:
-        self.noise = 200.0
+        self.noise = 300.0
+        self.dbg = os.environ.get("RBX_DEBUG") == "1"
+        self.n, self.peak, self.t = 0, 0, time.time()
+
+    def _debug(self, rms: int, thr: float, inside: bool) -> None:
+        if not self.dbg:
+            return
+        self.n, self.peak = self.n + 1, max(self.peak, rms)
+        if time.time() - self.t >= 3:
+            log(f"vad: кадров {self.n}, пик {self.peak}, шум {self.noise:.0f}, порог {thr:.0f}, в реплике {inside}")
+            self.n, self.peak, self.t = 0, 0, time.time()
 
     def utterance(self, mic: Mic) -> bytes:
-        voiced, pre, buf, silent = 0, [], [], 0.0
+        hits, pre, buf, silent = [], [], [], 0.0
         while True:
             fr = mic.frame()
-            if mic.muted:
-                voiced, buf, silent = 0, [], 0.0
-                continue
             rms = audioop.rms(fr, 2)
-            thr = max(300.0, self.noise * 3)
+            thr = max(150.0, self.noise * 4)
+            self._debug(rms, thr, bool(buf))
             if not buf:
-                self.noise = 0.95 * self.noise + 0.05 * rms if rms < thr else self.noise
+                if rms < thr:
+                    self.noise = 0.98 * self.noise + 0.02 * rms
                 pre = (pre + [fr])[-10:]
-                voiced = voiced + 1 if rms > thr else 0
-                if voiced >= START_FRAMES:
+                hits = (hits + [rms > thr])[-10:]
+                if sum(hits) >= START_FRAMES:  # речь рваная: 5 кадров из 10 выше порога
                     buf = list(pre)
                 continue
             buf.append(fr)
@@ -121,6 +152,7 @@ class Voice:
         self.stt = MiniMaxSTTProvider.maybe_from_env()
         if self.stt is None:
             raise SystemExit("нет MINIMAX_API_KEY для STT")
+        self.limited = False
 
     async def say(self, text: str, mic: Mic | None = None) -> float:
         t0 = time.time()
@@ -133,11 +165,26 @@ class Voice:
         finally:
             if mic:
                 await asyncio.sleep(0.3)  # хвост эха комнаты
+                mic.flush()
                 mic.muted = False
         return synth
 
+    def stt_limited(self) -> bool:
+        """Последний отказ STT — лимит провайдера (429): без паузы шум съест квоту."""
+        return self.limited
+
     def hear(self, pcm: bytes) -> str:
-        return (self.stt.recognize(wav_bytes(pcm)) or "").strip()
+        from rob_box_voice.stt_providers.minimax_provider import (  # noqa: PLC0415
+            MiniMaxSTTError, MiniMaxSTTRateLimitError)
+
+        self.limited = False
+        try:
+            return (self.stt.transcribe(wav_bytes(pcm)).text or "").strip()
+        except MiniMaxSTTRateLimitError:
+            self.limited = True
+        except MiniMaxSTTError as exc:
+            log(f"STT ошибка: {type(exc).__name__}")
+        return ""
 
 
 def load_env() -> None:
@@ -188,6 +235,10 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
             t2 = time.time()
             log(f"🎤 {len(pcm) / 2 / RATE:.1f} с → STT {t2 - t1:.2f} с: «{text}»")
             if not text:
+                if voice.stt_limited():
+                    log("STT 429 — пауза 20 с")
+                    await asyncio.sleep(20)
+                    mic.flush()
                 continue
             result = await stand.hear(text, chat.CONSOLE_VOICE, source=chat.SOURCE_VOICE)
             t3 = time.time()
