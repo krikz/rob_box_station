@@ -72,8 +72,8 @@ synth:
   speakers: [aidar, baya, kseniya, xenia, eugene]   # голоса Silero v4_ru
   rates: [x-slow, slow, medium, fast]
   pitches: [x-low, low, medium, high, x-high]
-  per_phrase: 20          # сколько озвучек на одну фразу класса (голос × скорость × высота — случайно)
-  per_negative: 6
+  per_phrase: 60          # сколько озвучек на одну фразу класса (голос × скорость × высота — случайно)
+  per_negative: 15
 
 model:
   width: 32              # каналы DS-CNN: 32 — ~6 млн умножений на окно, по силам процессору колонки
