@@ -1,8 +1,8 @@
 """Обновление колонки с GitHub по тегу (Шифу 07.11: «обновление колонки с гита», голосом «проверь обновление»).
 
 Тянется код колонки — релиз (тег) ``krikz/rob_box_station``: ``scripts/*.py``, ``assets/``. Промпт и настройки
-пользователя (``prompts/``, ``settings.json``, ``.env``) не трогаются. Репозиторий приватный — нужен токен только на
-чтение (``GITHUB_TOKEN`` в ``.env``, вводится на странице настроек).
+пользователя (``prompts/``, ``settings.json``, ``.env``) не трогаются. Закрытый репозиторий — нужен токен только
+на чтение (``GITHUB_TOKEN`` в ``.env``, вводится на странице настроек); открытый — работает без токена.
 
 Перед установкой — проверка места: свободно не меньше 3× архива + 2 МБ, иначе отказ словами.
 Порядок: старые файлы → ``prev/``, новые — на место, ``VERSION`` = тег, перезапуск хоста. Сторож (отдельный процесс,
@@ -30,8 +30,10 @@ def _get(url: str, token: str, accept: str = "application/vnd.github+json") -> b
 
     import certifi  # noqa: PLC0415
 
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "Accept": accept,
-                                               "User-Agent": "rbx-station"})
+    headers = {"Accept": accept, "User-Agent": "rbx-station"}
+    if token:  # закрытый репо — токен на чтение; открытый — без токена (лимит GitHub 60 запросов в час)
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=30, context=ssl.create_default_context(cafile=certifi.where())) as r:
         return r.read()
 
@@ -49,12 +51,12 @@ class Updater:
     def latest(self) -> Tuple[Optional[str], str]:
         """(новый тег или None, фраза). Тег — последний по дате коммита среди тегов ``v*``."""
         token = self.token()
-        if not token:
-            return None, "Для обновлений нужен токен гитхаба: впиши его на странице настроек."
         try:
             tags = json.loads(_get(f"https://api.github.com/repos/{REPO}/tags?per_page=20", token))
         except Exception as exc:  # noqa: BLE001
             self.log(f"⬆ проверка обновления: {type(exc).__name__}: {exc}")
+            if not token and "404" in str(exc):  # закрытый репо без токена GitHub отвечает 404
+                return None, "Репозиторий закрытый: для обновлений впиши токен гитхаба на странице настроек."
             return None, "Не смог проверить обновление: гитхаб не ответил."
         names = [t["name"] for t in tags if str(t.get("name", "")).startswith("v")]
         if not names:
