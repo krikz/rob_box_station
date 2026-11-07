@@ -388,6 +388,33 @@ def install_llm_hedge(hedge_s: float = HEDGE_S) -> None:
 STATION_STATE = {"volume": int(VOLUME), "mic_muted": False, "started": time.time()}
 
 
+#: Живые примеры для модели ключевых слов (``training/kws``): ``pos`` — первая секунда обращения с вейком в начале,
+#: ``neg`` — секунда из фразы без вейка. Потолок — место на ``/data`` (колонка, 35 МБ свободно); ``/tmp`` — в ОЗУ.
+KWS_DIR = Path(os.environ.get("RBX_KWS_DIR", str(BASE / "kws_real")))
+KWS_CAP_BYTES = int(os.environ.get("RBX_KWS_CAP_MB", "10")) * 2**20
+
+
+def kws_collect(pcm: bytes, text: str) -> None:
+    """Сохранить секунду фразы как живой пример (вейк в начале — ``pos``, без вейка — ``neg``); полно — молча мимо."""
+    words = [w.strip(",.!?") for w in text.lower().split()]
+    if not words:
+        return
+    kind = "pos" if words[0] in WAKE_WORDS else ("neg" if not set(words) & set(WAKE_WORDS) else "")
+    if not kind:
+        return  # вейк в середине — где он, без меток времени STT не знаем
+    try:
+        used = sum(f.stat().st_size for f in KWS_DIR.rglob("*.wav")) if KWS_DIR.exists() else 0
+        if used > KWS_CAP_BYTES:
+            return
+        sec = RATE * 2
+        start = 0 if kind == "pos" else max(0, (len(pcm) - sec) // 2 // 2 * 2)
+        chunk = pcm[start:start + int(sec * 1.2)]
+        (KWS_DIR / kind).mkdir(parents=True, exist_ok=True)
+        (KWS_DIR / kind / f"real__{int(time.time() * 1000)}.wav").write_bytes(wav_bytes(chunk))
+    except OSError as exc:
+        log(f"kws: пример не сохранён: {exc}")
+
+
 def save_setting(name: str, value: str) -> None:
     """Записать одну настройку в ``settings.json`` (как страница) и в окружение процесса."""
     try:
@@ -583,6 +610,7 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
             text = await asyncio.to_thread(voice.hear, pcm)
             t2 = time.time()
             log(f"🎤 {len(pcm) / 2 / RATE:.1f} с → STT {t2 - t1:.2f} с: «{text}»")
+            kws_collect(pcm, text)
             if not text:
                 if voice.stt_limited():
                     log("STT 429 — пауза 20 с")
