@@ -57,6 +57,8 @@ START_FRAMES, END_SILENCE_S, MIN_S, MAX_S = 5, 0.8, 0.7, 12.0
 TTS_FORMAT, TTS_RATE = "pcm_24000", 24000
 #: Потоковый синтез (SSE MiniMax): звук играет с первого куска, а не после всей фразы. 0 — целым куском (сравнение).
 TTS_STREAM = os.environ.get("RBX_TTS_STREAM", "1") != "0"
+#: Запас звука перед стартом ``aplay`` в потоке: куски SSE приходят неровно, без запаса речь рвётся.
+PREBUF_S = float(os.environ.get("RBX_PREBUF_S", "0.3"))
 #: Earcon «услышал»: ``sound_pack/button_click.mp3`` робота → s16le 24 кГц моно (ffmpeg на ПК, mp3 колонка не играет).
 HEARD_PCM = BASE / "assets" / "heard.raw"
 #: Хедж запроса LLM: DeepSeek на тот же промпт отвечает то за 2 с, то за 12 с (замер 07.11, ~4 из 15 запросов
@@ -233,13 +235,25 @@ class Voice:
         return synth
 
     async def _say_stream(self, text: str, on_sound, voice: str | None = None) -> float:
-        """Куски SSE пишутся в stdin ``aplay`` по мере прихода. Ошибка до первого куска — ``_NoAudioYet``."""
+        """Куски SSE пишутся в stdin ``aplay`` по мере прихода, после запаса ``PREBUF_S`` звука (07.11 без запаса
+        был провал ``underrun 450 мс`` посреди фразы). Ошибка до начала звука — ``_NoAudioYet``."""
         from rob_box_llm.tts import TTSFormat, TTSSettings  # noqa: PLC0415
 
         t0 = time.time()
         first = 0.0
         proc: subprocess.Popen | None = None
+        pending = b""
         settings = TTSSettings(format=TTSFormat.PCM, sample_rate=TTS_RATE, voice=voice)
+
+        def start(rate: int) -> subprocess.Popen:
+            nonlocal first
+            first = time.time() - t0
+            started = self.proc = subprocess.Popen(aplay_cmd(rate), stdin=subprocess.PIPE)
+            if on_sound:
+                on_sound()
+            return started
+
+        rate = TTS_RATE
         try:
             async for chunk in self.tts.stream(text, settings=settings):
                 if chunk.finish_reason == "error":
@@ -249,12 +263,18 @@ class Voice:
                     break
                 if not chunk.samples:
                     continue
+                rate = chunk.sample_rate or TTS_RATE
                 if proc is None:
-                    first = time.time() - t0
-                    proc = self.proc = subprocess.Popen(aplay_cmd(chunk.sample_rate or TTS_RATE), stdin=subprocess.PIPE)
-                    if on_sound:
-                        on_sound()
-                await asyncio.to_thread(proc.stdin.write, chunk.samples)
+                    pending += chunk.samples
+                    if len(pending) < int(PREBUF_S * rate) * 2:
+                        continue
+                    proc, data, pending = start(rate), pending, b""
+                else:
+                    data = chunk.samples
+                await asyncio.to_thread(proc.stdin.write, data)
+            if proc is None and pending and not self.cut:  # фраза короче запаса
+                proc = start(rate)
+                await asyncio.to_thread(proc.stdin.write, pending)
         except Exception as exc:  # noqa: BLE001
             if proc is None:
                 raise _NoAudioYet() from exc
@@ -364,6 +384,18 @@ def install_llm_hedge(hedge_s: float = HEDGE_S) -> None:
 STATION_STATE = {"volume": int(VOLUME), "mic_muted": False, "started": time.time()}
 
 
+def save_setting(name: str, value: str) -> None:
+    """Записать одну настройку в ``settings.json`` (как страница) и в окружение процесса."""
+    try:
+        data = json.loads(SETTINGS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    data[name] = value
+    SETTINGS.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.environ[name] = value
+    log(f"⚙ {name} = {value!r} сохранено")
+
+
 def wifi_now() -> dict:
     """Сеть и адрес колонки сейчас (``wpa_cli status``); нет утилиты или сети — пустые поля."""
     try:
@@ -384,6 +416,60 @@ def device_facts() -> str:
             f"- Settings page (keys, prompt, Wi-Fi, voice): {page}. Saving needs the Alice button press first.\n"
             "- Say an IP address by its number groups, as people read it aloud (10.1.1.13 → «десять, один, один, "
             "тринадцать»).")
+
+
+class _LogNode:
+    """Нода-заглушка для MCP-тулов робота: их ``log_info``/``log_warning`` идут в лог колонки."""
+
+    def get_logger(self):
+        return self
+
+    def info(self, msg: str) -> None:
+        log(msg)
+
+    warning = error = info
+
+    def debug(self, msg: str) -> None:
+        return
+
+
+def http_transport(method: str, url: str, headers, body, timeout: float) -> tuple:
+    """Транспорт поиска ``(статус, тело)`` на urllib: боевой транспорт робота живёт в модуле KIE и тянет
+    ``rob_box_music`` (на колонке его нет). HTTP-ошибка — статус; сеть — исключение (тул считает бэкенд упавшим)."""
+    import urllib.error  # noqa: PLC0415
+    import urllib.request  # noqa: PLC0415
+
+    import ssl  # noqa: PLC0415
+
+    import certifi  # noqa: PLC0415  (у Питона колонки нет системных корневых сертификатов — тот же набор, что у httpx)
+
+    req = urllib.request.Request(url, data=body, method=method, headers=dict(headers))
+    ctx = ssl.create_default_context(cafile=certifi.where())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:  # noqa: S310 — https, фикс. хост
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+
+
+def web_search(args: dict) -> tuple:
+    """Поиск в интернете — тот же тул, что у робота (``rob_box_mcp_tools.tools.web_search``): DuckDuckGo, запасной —
+    поиск DeepSeek по ключу ``DEEPSEEK_API_KEY``. HTTP синхронный: ход ждёт ответа поиска."""
+    try:
+        from dry_stand import load_tool_module  # noqa: PLC0415  (без tools/__init__: тот тянет rclpy)
+
+        SearchWebTool = load_tool_module("web_search").SearchWebTool  # noqa: N806
+    except ImportError as exc:
+        return False, {"status": "rejected", "reason": "unavailable", "detail": f"поиск не установлен: {exc}"}
+    query, limit = str(args.get("query") or ""), int(args.get("max_results") or 3)
+    res = SearchWebTool(_LogNode(), transport=http_transport).execute(query=query, max_results=limit)
+    data = dict(res.data or {})
+    if not res.success:
+        data.setdefault("status", "rejected")
+        data.setdefault("reason", res.error or "search_unavailable")
+    elif res.message:
+        data.setdefault("note", res.message)
+    return bool(res.success), data
 
 
 def install_station_tools(stand) -> None:
@@ -434,11 +520,11 @@ def install_station_tools(stand) -> None:
     tools._t_get_robot_status, tools._t_get_battery_level = status, battery
     tools._t_get_perception_context = perception
     tools._t_set_volume = volume
+    tools._t_search_web = web_search
     # Заглушки стенда консоли рапортуют «готово» за то, чего у колонки нет (музыка, лицо, звуки) — честный отказ.
     for name, what in (("request_music", "музыки"), ("generate_music", "музыки"), ("music_library", "музыки"),
                        ("dj_set", "музыки"), ("set_music_volume", "музыки"), ("play_animation", "лица и анимаций"),
-                       ("play_sound", "библиотеки звуков"), ("get_sound_info", "библиотеки звуков"),
-                       ("search_web", "интернет-поиска")):
+                       ("play_sound", "библиотеки звуков"), ("get_sound_info", "библиотеки звуков")):
         setattr(tools, f"_t_{name}", unavailable(what))
 
 
@@ -564,6 +650,8 @@ class LiveOut:
             if applied:
                 log(f"голос {applied!r} провайдера {provider} на колонке не играет — говорю MiniMax по умолчанию")
             return None
+        if applied and applied != os.environ.get("RBX_VOICE"):
+            save_setting("RBX_VOICE", applied)  # голос, выбранный словами, переживает перезапуск
         return applied or os.environ.get("RBX_VOICE") or None
 
     def begin(self, t1: float) -> None:
