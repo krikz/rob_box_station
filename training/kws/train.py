@@ -34,11 +34,21 @@ def load_wav(path: Path, sr: int) -> torch.Tensor:
     return torchaudio.functional.resample(wav, rate, sr) if rate != sr else wav
 
 
+SPEEDS = (0.9, 1.0, 1.1)
+
+
 def collect(root: Path, sr: int):
-    """{класс: [(голос, волна)]} из ``root/<класс>/*.wav``."""
+    """{класс: [(голос, волна)]} из ``root/<класс>/*.wav``; каждый клип — в трёх скоростях (±10 %), посчитанных один раз
+    (ресемплинг на каждом примере занимал процессор, видеокарта простаивала — 07.11)."""
     out = {}
     for folder in sorted(p for p in root.glob("*") if p.is_dir()):
-        out[folder.name] = [(f.name.split("__")[0], load_wav(f, sr)) for f in sorted(folder.glob("*.wav"))]
+        items = []
+        for f in sorted(folder.glob("*.wav")):
+            wav = load_wav(f, sr)
+            for k in SPEEDS:
+                items.append((f.name.split("__")[0], wav if k == 1.0 else
+                              torchaudio.functional.resample(wav, int(sr * k), sr)))
+        out[folder.name] = items
     return out
 
 
@@ -91,9 +101,6 @@ class Mixer:
         return white if self.rnd.random() < 0.5 else torch.cumsum(white, 0) * 0.02  # белый / «красный»
 
     def _place(self, wav: torch.Tensor) -> torch.Tensor:
-        if self.rnd.random() < 0.5:  # скорость ±10 %
-            k = self.rnd.uniform(0.9, 1.1)
-            wav = torchaudio.functional.resample(wav, int(self.sr * k), self.sr)
         out = torch.zeros(self.n)
         if len(wav) >= self.n:
             start = self.rnd.randrange(len(wav) - self.n + 1)
@@ -101,10 +108,6 @@ class Mixer:
         else:
             start = self.rnd.randrange(self.n - len(wav) + 1)
             out[start:start + len(wav)] = wav
-        if self.rnd.random() < 0.3:  # простое эхо комнаты
-            ir = torch.exp(-torch.arange(int(0.08 * self.sr)) / (0.02 * self.sr)) * torch.randn(int(0.08 * self.sr))
-            ir[0] = 1.0
-            out = torchaudio.functional.fftconvolve(out, ir)[: self.n]
         return out / (out.abs().max() + 1e-6) * self.rnd.uniform(0.1, 0.9)
 
     def example(self, label: str, pool: str):
@@ -132,6 +135,22 @@ class Mixer:
             xs.append(x)
             ys.append(y)
         return torch.stack(xs), torch.tensor(ys)
+
+
+def reverb(x: torch.Tensor, share: float = 0.3, sr: int = 16000) -> torch.Tensor:
+    """Простое эхо комнаты пакетом на видеокарте: у доли ``share`` примеров — свёртка с затухающим шумом 80 мс."""
+    n, length = x.shape[0], int(0.08 * sr)
+    pick = torch.rand(n, device=x.device) < share
+    if not pick.any():
+        return x
+    decay = torch.exp(-torch.arange(length, device=x.device) / (0.02 * sr))
+    ir = torch.randn(int(pick.sum()), length, device=x.device) * decay * torch.rand(int(pick.sum()), 1, device=x.device)
+    ir[:, 0] = 1.0
+    size = x.shape[1] + length
+    wet = torch.fft.irfft(torch.fft.rfft(x[pick], size) * torch.fft.rfft(ir, size), size)[:, : x.shape[1]]
+    x = x.clone()
+    x[pick] = wet / (wet.abs().amax(1, keepdim=True) + 1e-6) * x[pick].abs().amax(1, keepdim=True)
+    return x
 
 
 def split(synth: dict, real: dict, val_speaker: str):
@@ -175,14 +194,14 @@ def main() -> None:
     synth = collect(HERE / "data" / "synth", sr)
     real = collect(HERE / "data" / "real", sr) if (HERE / "data" / "real").exists() else {}
     noise = [load_wav(p, sr) for p in sorted((HERE / "data" / "noise").glob("*.wav"))]
-    print(f"классы {labels}; озвучка {sum(map(len, synth.values()))}, живые {sum(map(len, real.values()))}, "
-          f"фон {len(noise)} файлов")
+    print(f"классы {labels}; озвучка {sum(map(len, synth.values()))}, живые {sum(map(len, real.values()))} "
+          f"(с вариантами скорости), фон {len(noise)} файлов", flush=True)
     pools = split(synth, real, t["val_speaker"])
     mixer = Mixer(cfg, pools, noise, labels, random.Random(0))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     width = int(cfg.get("model", {}).get("width", 32))
     feats, model = Features(sr).to(device), DSCNN(len(labels), width).to(device)
-    print(f"параметров модели: {sum(p.numel() for p in model.parameters())}, устройство {device}")
+    print(f"параметров модели: {sum(p.numel() for p in model.parameters())}, устройство {device}", flush=True)
     opt = torch.optim.AdamW(model.parameters(), lr=t["lr"], weight_decay=1e-3)
     steps = t["epochs"] * (t["examples_per_epoch"] // t["batch"])
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=t["lr"], total_steps=steps)
@@ -190,7 +209,7 @@ def main() -> None:
     for epoch in range(t["epochs"]):
         for _ in range(t["examples_per_epoch"] // t["batch"]):
             x, y = mixer.batch(t["batch"], "train")
-            loss = F.cross_entropy(model(feats(x.to(device))), y.to(device), label_smoothing=0.05)
+            loss = F.cross_entropy(model(feats(reverb(x.to(device)))), y.to(device), label_smoothing=0.05)
             opt.zero_grad()
             loss.backward()
             opt.step()

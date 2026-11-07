@@ -394,6 +394,24 @@ KWS_DIR = Path(os.environ.get("RBX_KWS_DIR", str(BASE / "kws_real")))
 KWS_CAP_BYTES = int(os.environ.get("RBX_KWS_CAP_MB", "10")) * 2**20
 
 
+#: Своя модель ключевых слов (``training/kws``, программа на C ``kws_run``). Пока режим тени: считает каждую фразу
+#: параллельно с облачным STT и пишет ответ в лог — решение ещё за облаком (сравнить на живой речи, потом доверять).
+KWS_BIN = BASE / "kws" / "kws_run"
+KWS_MODEL = BASE / "kws" / "kws_model.bin"
+
+
+def kws_score(pcm: bytes) -> tuple:
+    """(метка, вероятность) лучшего окна первых 2 с фразы; нет модели или сбой — ``("", 0.0)``."""
+    if not (KWS_BIN.exists() and KWS_MODEL.exists()):
+        return "", 0.0
+    try:
+        out = subprocess.run([str(KWS_BIN), str(KWS_MODEL), "2.0", "0.1"], input=pcm[: RATE * 2 * 2],
+                             capture_output=True, timeout=5).stdout.decode().split()
+        return out[0], float(out[1])
+    except (OSError, subprocess.TimeoutExpired, IndexError, ValueError):
+        return "", 0.0
+
+
 def kws_collect(pcm: bytes, text: str) -> None:
     """Сохранить секунду фразы как живой пример (вейк в начале — ``pos``, без вейка — ``neg``); полно — молча мимо."""
     words = [w.strip(",.!?") for w in text.lower().split()]
@@ -610,9 +628,12 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
         while True:
             pcm = await asyncio.to_thread(vad.utterance, mic)
             t1 = time.time()
+            kws_task = asyncio.ensure_future(asyncio.to_thread(kws_score, pcm))  # тень: параллельно с облаком
             text = await asyncio.to_thread(voice.hear, pcm)
             t2 = time.time()
-            log(f"🎤 {len(pcm) / 2 / RATE:.1f} с → STT {t2 - t1:.2f} с: «{text}»")
+            label, prob = await kws_task
+            log(f"🎤 {len(pcm) / 2 / RATE:.1f} с → STT {t2 - t1:.2f} с: «{text}»"
+                + (f"  🔑 kws {label} {prob:.2f}" if label else ""))
             kws_collect(pcm, text)
             if not text:
                 if voice.stt_limited():
