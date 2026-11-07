@@ -38,7 +38,7 @@ AUTH_S = 60.0
 WIFI_WAIT_S = 30.0
 HTTP_PORT = int(os.environ.get("RBX_HTTP_PORT", "8080"))
 #: Ключи, которые правятся со страницы (имена из ``scripts/dialogue/.env`` колонки).
-KEY_NAMES = ("DEEPSEEK_API_KEY", "MINIMAX_API_KEY", "MINIMAX_GROUP_ID")
+KEY_NAMES = ("DEEPSEEK_API_KEY", "MINIMAX_API_KEY", "MINIMAX_GROUP_ID", "GITHUB_TOKEN")  # GITHUB_TOKEN — обновления
 #: Голоса MiniMax для выбора на странице (id → как назвать); пусто — голос по умолчанию.
 VOICES = {"": "по умолчанию", "Russian_ReliableMan": "Надёжный мужчина", "Russian_BrightHeroine": "Яркая героиня",
           "Russian_AttractiveGuy": "Обаятельный парень", "Russian_AmbitiousWoman": "Целеустремлённая женщина"}

@@ -613,6 +613,7 @@ async def one_turn(voice: Voice, args: argparse.Namespace) -> None:
 
 async def serve(voice: Voice, args: argparse.Namespace) -> None:
     import station_bt  # noqa: PLC0415  (Bluetooth-музыка: сопряжение и пульт плеера телефона)
+    import station_update  # noqa: PLC0415  (обновление колонки с GitHub по тегу)
 
     chat, stand = make_stand(args)
     log("слушаю")
@@ -622,6 +623,9 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
     live = LiveOut(stand, voice, mic, ring)
     buttons = Buttons(mic, ring, live)
     bt = station_bt.BtMedia(log)
+    updater = station_update.Updater(BASE, lambda: os.environ.get("GITHUB_TOKEN", ""), log)
+    asyncio.get_running_loop().call_later(30, station_update.OK_MARK.touch)  # «здоров» — сторож отката не нужен
+    log(f"версия колонки: {updater.current()}")
     Keys(asyncio.get_running_loop(), buttons.on_key)
     await start_setup(stand, mic, ring, buttons)
     try:
@@ -645,6 +649,17 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
             live.begin(t1)
             words = text.split()
             if words and words[0].lower().strip(",.!?") in WAKE_WORDS:
+                if station_update.is_update_command(" ".join(words[1:])):  # обновление: решает код
+                    live.earcon()
+                    tag, phrase = await asyncio.to_thread(updater.latest)
+                    live.speak(phrase)
+                    if tag:
+                        live.speak(await asyncio.to_thread(updater.install, tag))
+                    await live.drain()
+                    if tag:
+                        restart_self(mic)
+                    mic.flush()
+                    continue
                 reply = await bt.handle(" ".join(words[1:]))
                 if reply:  # Bluetooth-музыка: решает код, ход модели не нужен
                     live.earcon()
