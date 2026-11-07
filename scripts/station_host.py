@@ -653,10 +653,11 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
                     live.earcon()
                     tag, phrase = await asyncio.to_thread(updater.latest)
                     live.speak(phrase)
+                    done = await asyncio.to_thread(updater.install, tag) if tag else ""
                     if tag:
-                        live.speak(await asyncio.to_thread(updater.install, tag))
+                        live.speak(done or "Не смог скачать обновление, попробуй позже.")
                     await live.drain()
-                    if tag:
+                    if done.startswith("Обновляюсь"):
                         restart_self(mic)
                     mic.flush()
                     continue

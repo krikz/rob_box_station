@@ -68,7 +68,11 @@ class Updater:
 
     def install(self, tag: str) -> str:
         """Скачать тег, отложить старое в ``prev/``, поставить новое, взвести сторожа отката."""
-        raw = _get(f"https://api.github.com/repos/{REPO}/tarball/{tag}", self.token(), "application/vnd.github.tar")
+        try:
+            raw = _get(f"https://api.github.com/repos/{REPO}/tarball/{tag}", self.token(), "application/vnd.github.tar")
+        except Exception as exc:  # noqa: BLE001 — сеть не роняет хост (07.11: тайм-аут codeload уронил хост)
+            self.log(f"⬆ {tag} не скачана: {type(exc).__name__}: {exc}")
+            return ""
         need = len(raw) * 3 + 2 * 2**20  # архив + старая копия (prev/) + новые файлы, с запасом
         free = shutil.disk_usage(self.base).free
         if free < need:  # Шифу 07.11: «надо проверять, что места хватает»
