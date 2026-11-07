@@ -594,6 +594,8 @@ async def one_turn(voice: Voice, args: argparse.Namespace) -> None:
 
 
 async def serve(voice: Voice, args: argparse.Namespace) -> None:
+    import station_bt  # noqa: PLC0415  (Bluetooth-музыка: сопряжение и пульт плеера телефона)
+
     chat, stand = make_stand(args)
     log("слушаю")
     mic, vad = Mic(), Vad()
@@ -601,6 +603,7 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
     ring.idle()
     live = LiveOut(stand, voice, mic, ring)
     buttons = Buttons(mic, ring, live)
+    bt = station_bt.BtMedia(log)
     Keys(asyncio.get_running_loop(), buttons.on_key)
     await start_setup(stand, mic, ring, buttons)
     try:
@@ -619,6 +622,15 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
                 continue
             text = buttons.address(text)
             live.begin(t1)
+            words = text.split()
+            if words and words[0].lower().strip(",.!?") in WAKE_WORDS:
+                reply = await bt.handle(" ".join(words[1:]))
+                if reply:  # Bluetooth-музыка: решает код, ход модели не нужен
+                    live.earcon()
+                    live.speak(reply)
+                    await live.drain()
+                    mic.flush()
+                    continue
             result = await stand.hear(text, chat.CONSOLE_VOICE, source=chat.SOURCE_VOICE)
             t3 = time.time()
             if not result.addressed:
@@ -715,6 +727,10 @@ class LiveOut:
                 self._queue.task_done()
                 if self._ring and self._queue.empty():
                     self._ring.idle()
+
+    def speak(self, text: str) -> None:
+        """Фраза кода (не хода модели) — в ту же очередь динамика."""
+        self._queue.put_nowait((text, self.voice()))
 
     def busy(self) -> bool:
         return not self._queue.empty() or (self._voice.proc is not None and self._voice.proc.poll() is None)

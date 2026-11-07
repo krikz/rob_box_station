@@ -56,7 +56,7 @@ class Features(nn.Module):
 
 
 class DSCNN(nn.Module):
-    """Маленькая DS-CNN (~25 тыс. параметров): под процессор колонки."""
+    """Маленькая DS-CNN (при ширине 32 — ~6 тыс. параметров): под процессор колонки."""
 
     def __init__(self, n_classes: int, width: int = 64) -> None:
         super().__init__()
@@ -180,7 +180,8 @@ def main() -> None:
     pools = split(synth, real, t["val_speaker"])
     mixer = Mixer(cfg, pools, noise, labels, random.Random(0))
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    feats, model = Features(sr).to(device), DSCNN(len(labels)).to(device)
+    width = int(cfg.get("model", {}).get("width", 32))
+    feats, model = Features(sr).to(device), DSCNN(len(labels), width).to(device)
     print(f"параметров модели: {sum(p.numel() for p in model.parameters())}, устройство {device}")
     opt = torch.optim.AdamW(model.parameters(), lr=t["lr"], weight_decay=1e-3)
     steps = t["epochs"] * (t["examples_per_epoch"] // t["batch"])
@@ -216,7 +217,8 @@ def export(model, feats, labels, cfg, acc, fa, conf) -> None:
     fb = feats.mel.mel_scale.fb.numpy()  # [n_fft/2+1, n_mels]
     np.savez(out / "kws.npz", mel_fb=fb, **{k: v.numpy() for k, v in model.state_dict().items()})
     meta = {"labels": labels, "sample_rate": cfg["sample_rate"], "window_s": cfg["window_s"], "n_fft": N_FFT,
-            "hop": HOP, "n_mels": N_MELS, "log_eps": 1e-6, "cmn": "mean over time", "input": list(example.shape)}
+            "hop": HOP, "n_mels": N_MELS, "log_eps": 1e-6, "cmn": "mean over time", "input": list(example.shape),
+            "width": int(cfg.get("model", {}).get("width", 32))}
     (out / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
     lines = [f"точность (голос, которого не было в обучении): {acc:.3f}",
              f"ложные срабатывания (чужие слова и тишина с уверенностью > 0.8): {fa:.4f}", "",
