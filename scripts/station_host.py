@@ -71,7 +71,7 @@ KEY_GUARD_S = 0.15
 VOL_MIN, VOL_MAX, VOL_STEP = 60, 255, 25
 #: Кнопка Алисы без речи: следующая фраза в это окно адресована колонке без вейка.
 ARM_S = 8.0
-LED_BRIGHT = int(os.environ.get("RBX_LED", "60"))
+LED_BRIGHT = int(os.environ.get("RBX_LED", "255"))  # из 255; 255 — яркость анимаций Алисы
 
 
 def log(msg: str) -> None:
@@ -701,13 +701,48 @@ class LiveOut:
         self._player.cancel()
 
 
-class Ring:
-    """Кольцо из трёх RGB-диодов (``/sys/class/leds/micro:{red,green,blue}:ring{1,2,3}``): состояние колонки эффектом,
-    как у Алисы, а не одним цветом. Кадры считает цикл asyncio (~12 в секунду); в sysfs пишется только то, что
-    изменилось. Эффекты: слушаю — синее дыхание, думаю — фиолетовый огонёк бежит по кругу, говорю — зелёная пульсация,
-    микрофон выкл — ровный красный, громкость — белые диоды по уровню на 1,2 с."""
+#: Родные анимации кольца Алисы (прошивка колонки): ``loop`` / ``gammacorrection`` в заголовке, дальше кадры
+#: «цвет1 цвет2 цвет3 мс» (hex RGB трёх диодов). Нет каталога — эффекты кольца считает код (``Ring._frame``).
+LED_PATTERNS = Path(os.environ.get("RBX_LED_PATTERNS", "/system/vendor/quasar/ledpatterns"))
+#: Состояние кольца → шаблон Алисы.
+RING_PATTERNS = {"listen": "alice_listening", "think": "alice_thinking", "speak": "alice_speaking",
+                 "connect": "connecting_to_network", "error": "error"}
 
-    COLORS = {"off": (0, 0, 0), "listen": (0, 0, 1), "think": (1, 0, 1), "speak": (0, 1, 0), "muted": (1, 0, 0)}
+
+def load_led_pattern(path: Path):
+    """Шаблон ``.led`` → (зациклен, гамма, [((r,g,b)×3, мс)]); битый или нет файла — ``None``."""
+    try:
+        lines = path.read_text(encoding="ascii").split("\n")
+    except (OSError, UnicodeDecodeError):
+        return None
+    loop = gamma = False
+    frames = []
+    for line in lines:
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] in ("loop", "gammacorrection"):
+            loop, gamma = loop or parts[0] == "loop", gamma or parts[0] == "gammacorrection"
+            continue
+        if len(parts) != 4:
+            continue
+        try:
+            leds = tuple(tuple(int(c[i:i + 2], 16) for i in (0, 2, 4)) for c in parts[:3])
+            frames.append((leds, max(10, int(parts[3]))))
+        except ValueError:
+            continue
+    return (loop, gamma, frames) if frames else None
+
+
+class Ring:
+    """Кольцо из трёх RGB-диодов (``/sys/class/leds/micro:{red,green,blue}:ring{1,2,3}``): состояние колонки эффектом.
+
+    Слушаю / думаю / говорю / подключаюсь к сети / ошибка — родные анимации Алисы (``RING_PATTERNS``), их нет —
+    эффекты кода (дыхание, бегущий огонёк, пульс). Микрофон выкл — ровный красный, громкость — белые диоды по уровню
+    на 1,2 с. Яркость ``LED_BRIGHT`` из 255: 255 — как у Алисы. В sysfs пишется только изменившееся."""
+
+    COLORS = {"off": (0, 0, 0), "listen": (0, 0, 1), "think": (1, 0, 1), "speak": (0, 1, 0), "muted": (1, 0, 0),
+              "connect": (1, 1, 1), "error": (1, 0, 0)}
     FPS = 12
 
     def __init__(self, mic: Mic | None) -> None:
@@ -717,6 +752,10 @@ class Ring:
         self._last: dict = {}
         self._override: tuple | None = None  # (rgb, сколько диодов, до какого времени) — громкость
         self._since = time.monotonic()
+        self._patterns = {state: load_led_pattern(LED_PATTERNS / f"{name}.led")
+                          for state, name in RING_PATTERNS.items()}
+        found = [s for s, p in self._patterns.items() if p]
+        log(f"кольцо: анимации Алисы — {', '.join(found) or 'нет (эффекты кода)'}")
         try:
             self._task = asyncio.get_running_loop().create_task(self._run())
         except RuntimeError:  # без цикла (тесты, --say) — без анимации
@@ -735,44 +774,71 @@ class Ring:
                 log(f"LED недоступны: {exc}")
                 self._warned = True
 
+    def _show(self, leds) -> None:
+        """Три цвета ``(r, g, b)`` 0..255 — на диоды, с яркостью ``LED_BRIGHT``."""
+        k = max(0, min(255, LED_BRIGHT)) / 255
+        for i, rgb in enumerate(leds, start=1):
+            for color, value in zip(("red", "green", "blue"), rgb):
+                self._led(color, i, int(value * k))
+
     def _frame(self, t: float) -> list:
-        """Яркость (0..1) каждого из трёх диодов и цвет для текущего состояния в момент ``t`` от начала эффекта."""
+        """Запасной эффект кода: яркость (0..1) трёх диодов в момент ``t`` от начала состояния."""
         import math  # noqa: PLC0415
 
         if self.state == "listen":
             k = 0.25 + 0.75 * (0.5 - 0.5 * math.cos(2 * math.pi * t / 1.6))
             return [k, k, k]
-        if self.state == "think":
+        if self.state in ("think", "connect"):
             head = (t / 0.9 * 3) % 3  # огонёк обходит три диода за 0,9 с
             return [max(0.12, 1 - min(abs(i - head), 3 - abs(i - head))) for i in range(3)]
         if self.state == "speak":
             k = 0.45 + 0.55 * (0.5 - 0.5 * math.cos(2 * math.pi * t / 0.7))
             return [k, k, k]
-        return [1.0, 1.0, 1.0] if self.state == "muted" else [0.0, 0.0, 0.0]
+        return [1.0, 1.0, 1.0] if self.state in ("muted", "error") else [0.0, 0.0, 0.0]
 
-    def _paint(self, rgb: tuple, levels: list) -> None:
-        for i, k in enumerate(levels, start=1):
-            for color, on in zip(("red", "green", "blue"), rgb):
-                self._led(color, i, int(LED_BRIGHT * k) if on else 0)
+    def _pattern_frame(self, pattern, t: float):
+        """Кадр шаблона Алисы в момент ``t``; шаблон без ``loop`` кончился — ``None``."""
+        loop, gamma, frames = pattern
+        total = sum(ms for _, ms in frames) / 1000
+        if not loop and t >= total:
+            return None
+        t = t % total
+        for leds, ms in frames:
+            t -= ms / 1000
+            if t < 0:
+                return tuple(tuple(int(255 * (v / 255) ** 2.2) for v in rgb) for rgb in leds) if gamma else leds
+        return frames[-1][0]
 
     async def _run(self) -> None:
         while True:
             now = time.monotonic()
+            wait = 1 / self.FPS
             if self._override and now < self._override[2]:
                 rgb, lit, _ = self._override
-                self._paint(rgb, [1.0 if i < lit else 0.0 for i in range(3)])
+                self._show([tuple(255 * c for c in rgb) if i < lit else (0, 0, 0) for i in range(3)])
             else:
                 self._override = None
-                self._paint(self.COLORS[self.state], self._frame(now - self._since))
-            still = self._override is None and self.state in ("off", "muted")  # без анимации — реже просыпаться
-            await asyncio.sleep(0.2 if still else 1 / self.FPS)
+                pattern = self._patterns.get(self.state)
+                frame = self._pattern_frame(pattern, now - self._since) if pattern else None
+                if frame is not None:
+                    self._show(frame)
+                    wait = 0.04  # кадры Алисы — по 40 мс
+                elif pattern is not None:  # одноразовый шаблон (ошибка) кончился
+                    self.idle()
+                else:
+                    rgb = self.COLORS[self.state]
+                    self._show([tuple(int(255 * c * k) for c in rgb) for k in self._frame(now - self._since)])
+                    if self.state in ("off", "muted"):
+                        wait = 0.2  # без анимации — реже просыпаться
+            await asyncio.sleep(wait)
 
     def set(self, state: str) -> None:
         if state != self.state:
             self._since = time.monotonic()
         self.state = state
         if self._task is None:
-            self._paint(self.COLORS[state], self._frame(0.0))
+            rgb = self.COLORS.get(state, (0, 0, 0))
+            self._show([tuple(255 * c for c in rgb)] * 3)
 
     def idle(self) -> None:
         self.set("muted" if self._mic is not None and self._mic.user_muted else "off")

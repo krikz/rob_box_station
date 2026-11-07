@@ -338,7 +338,7 @@ def render_page(settings: Dict[str, str], env: Dict[str, str], note: str = "", p
 {field("Вейк-слова (через запятую)", "wake", settings.get("RBX_WAKE", ""))}
 <label>Голос<select name="voice">{voices}</select></label>
 {field("Громкость (60–255)", "volume", settings.get("RBX_VOLUME", "230"), "number")}
-{field("Яркость кольца (0–255)", "led", settings.get("RBX_LED", "60"), "number")}
+{field("Яркость кольца (0–255)", "led", settings.get("RBX_LED", "255"), "number")}
 <h3>Ключи</h3>{keys}
 <button type="submit">Сохранить</button></form>{prompt_form}{wifi_form}</body></html>"""
 
