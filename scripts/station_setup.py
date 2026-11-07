@@ -249,9 +249,12 @@ class Prompts:
         extra = self.extra().strip()
         return self.base().rstrip() + ("\n\n# STATION (колонка «Игорёк»)\n" + extra + "\n" if extra else "\n")
 
-    def materialize(self, out_dir: Path) -> Path:
+    def materialize(self, out_dir: Path, facts: str = "") -> Path:
+        """Собрать промпт хода в ``out_dir``: основа + дополнение + ``facts`` (факты устройства строит код хоста)."""
         out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / self.FILE).write_text(self.effective(), encoding="utf-8")
+        section = f"\n# DEVICE FACTS (built by code at start, true)\n{facts.strip()}\n" if facts else ""
+        text = self.effective() + section
+        (out_dir / self.FILE).write_text(text, encoding="utf-8")
         return out_dir
 
     def save(self, base: str, extra: str, reset: bool) -> str:

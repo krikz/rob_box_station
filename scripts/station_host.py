@@ -360,6 +360,61 @@ def install_llm_hedge(hedge_s: float = HEDGE_S) -> None:
     DeepSeekProvider.complete = hedged
 
 
+#: Живое состояние колонки для инструментов статуса (кнопки и хост его обновляют).
+STATION_STATE = {"volume": int(VOLUME), "mic_muted": False, "started": time.time()}
+
+
+def wifi_now() -> dict:
+    """Сеть и адрес колонки сейчас (``wpa_cli status``); нет утилиты или сети — пустые поля."""
+    try:
+        out = subprocess.run(["wpa_cli", "-i", "wlan0", "status"], capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {"ssid": "", "ip": ""}
+    status = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+    return {"ssid": status.get("ssid", ""), "ip": status.get("ip_address", "")}
+
+
+def device_facts() -> str:
+    """Факты устройства в промпт (ADR-0148: факт строит код, модель произносит). 07.11 модель на «какой у тебя адрес»
+    отвечала «не знаю», не вызывая ``get_robot_status``. Адрес меняется со сменой Wi-Fi — тогда хост перезапускается."""
+    net = wifi_now()
+    port = os.environ.get("RBX_HTTP_PORT", "8080")
+    page = f"http://{net['ip']}:{port}/" if net["ip"] else "нет (нет сети)"
+    return (f"- You are a smart speaker (Yandex Station Lite hardware), not a rover: no wheels, no camera, no battery "
+            f"(mains powered).\n- Wi-Fi network: {net['ssid'] or 'none'}; IP address: {net['ip'] or 'none'}.\n"
+            f"- Settings page (keys, prompt, Wi-Fi, voice): {page}. Saving needs the Alice button press first.\n"
+            "- Say an IP address by its number groups, as people read it aloud (10.1.1.13 → «десять, один, один, "
+            "тринадцать»).")
+
+
+def install_station_tools(stand) -> None:
+    """Инструменты состояния — настоящие колонки, а не выдумки стенда консоли (07.11: «заряд 87 %», «никого в кадре»,
+    и колонка не знала свой адрес). Стенд ищет обработчик ``_t_<тул>`` у ``stand.tools`` — подменяем в экземпляре."""
+    tools = stand.tools
+
+    def status(args: dict) -> tuple:
+        net = wifi_now()
+        port = os.environ.get("RBX_HTTP_PORT", "8080")
+        return True, {
+            "device": "колонка (Яндекс Станция Лайт), не робот: не ездит, камеры и батареи нет",
+            "name": (WAKE_WORDS[2] if len(WAKE_WORDS) > 2 else WAKE_WORDS[0]).capitalize(),
+            "network": {"wifi_ssid": net["ssid"] or None, "ip_address": net["ip"] or None,
+                        "settings_page": f"http://{net['ip']}:{port}/" if net["ip"] else None},
+            "volume": f"{STATION_STATE['volume']} из 255", "microphone": "выключен кнопкой"
+            if STATION_STATE["mic_muted"] else "включён",
+            "power": "от сети, батареи нет", "uptime_min": round((time.time() - STATION_STATE["started"]) / 60),
+        }
+
+    def battery(args: dict) -> tuple:
+        return True, {"status": "no_battery", "battery_level": None, "power": "колонка работает от сети, батареи нет"}
+
+    def perception(args: dict) -> tuple:
+        return False, {"status": "rejected", "reason": "unavailable", "detail": "у колонки нет камеры"}
+
+    tools._t_get_robot_status, tools._t_get_battery_level = status, battery
+    tools._t_get_perception_context = perception
+
+
 def make_stand(args: argparse.Namespace):
     import chat  # noqa: PLC0415
 
@@ -367,13 +422,14 @@ def make_stand(args: argparse.Namespace):
 
     install_llm_hedge()
     prompts = station_prompts(setup)
-    chat.dm.PROMPT_DIR = prompts.materialize(Path(args.workdir) / "prompt")  # основа колонки + дополнение
+    chat.dm.PROMPT_DIR = prompts.materialize(Path(args.workdir) / "prompt", device_facts())  # основа + дополнение
     log(f"промпт: основа {'своя' if prompts.is_own() else 'ядра'}"
         f"{', дополнение ' + str(len(prompts.extra().strip())) + ' знаков' if prompts.extra().strip() else ''}")
     t0 = time.time()
     cargs = chat.build_arg_parser().parse_args(["--wake-word"] + (["--db", args.db] if args.db else []))
     stand = chat.build_stand(cargs, Path(args.workdir))
     stand.wake = list(WAKE_WORDS)  # таблица вейков робота (wake_words.yaml) колонке не подходит
+    install_station_tools(stand)
     log(f"ядро готово за {time.time() - t0:.1f} с (вейк: {', '.join(WAKE_WORDS)})")
     return chat, stand
 
@@ -622,6 +678,7 @@ class Buttons:
             self._volume(VOL_STEP if code == KEY_VOL_UP else -VOL_STEP)
         elif code == KEY_MUTE:
             self._mic.user_muted = not self._mic.user_muted
+            STATION_STATE["mic_muted"] = self._mic.user_muted
             self._mic.flush()
             if not self._live.busy():
                 self._ring.idle()
@@ -631,6 +688,7 @@ class Buttons:
 
     def _volume(self, step: int) -> None:
         self.volume = max(VOL_MIN, min(VOL_MAX, self.volume + step))
+        STATION_STATE["volume"] = self.volume
         subprocess.run(["amixer", "-q", "sset", "Master", str(self.volume)], check=False)
         self._ring.level(self.volume)
         if not self._live.busy():
@@ -697,7 +755,7 @@ async def start_setup(stand, mic: Mic, ring: Ring, buttons: "Buttons") -> None:
         WAKE_WORDS[:] = [w for w in new["RBX_WAKE"].split(",") if w]
         stand.wake = list(WAKE_WORDS)
         LED_BRIGHT = int(new["RBX_LED"])
-        buttons.volume = int(new["RBX_VOLUME"])
+        buttons.volume = STATION_STATE["volume"] = int(new["RBX_VOLUME"])
         subprocess.run(["amixer", "-q", "sset", "Master", new["RBX_VOLUME"]], check=False)
         ring.idle()
         if keys:  # провайдеры собраны при старте — новые ключи берёт только новый процесс
@@ -712,9 +770,16 @@ async def start_setup(stand, mic: Mic, ring: Ring, buttons: "Buttons") -> None:
         await setup.SettingsServer(SETTINGS, CORE / "scripts" / "dialogue" / ".env", auth, on_saved, log,
                                    prompts=station_prompts(setup),
                                    on_prompt=lambda: asyncio.get_running_loop().call_later(1.0, restart_self, mic),
-                                   on_wifi=lambda ok: ring.flash("speak" if ok else "muted")).start()
+                                   on_wifi=lambda ok: wifi_done(ok, ring, mic)).start()
     except OSError as exc:
         log(f"⚙ страница настроек не поднялась: {exc}")
+
+
+def wifi_done(ok: bool, ring: "Ring", mic: Mic) -> None:
+    """Итог смены сети: кольцо цветом; удача — перезапуск, чтобы факты устройства взяли новый адрес."""
+    ring.flash("speak" if ok else "muted")
+    if ok:
+        asyncio.get_running_loop().call_later(4.0, restart_self, mic)
 
 
 def station_prompts(setup):
