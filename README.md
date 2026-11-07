@@ -124,6 +124,7 @@ ssh -p 2222 root@10.1.1.13 'mount -o remount,rw / && cat > /etc/init.d/S99zzyand
 python -I tools/prune_python.py py.tar.gz py_pruned.tar.gz
 ssh -p 2222 root@10.1.1.13 'cd /data/opt && rm -rf python && gunzip -c | tar xf -' < py_pruned.tar.gz
 # колёса: pip download --only-binary=:all: --python-version 3.12 --platform manylinux2014_armv7l … -d dl_whl
+# + чистый Питон: pip download dbus-next==0.2.3 --no-deps -d dl_whl  (Improv по Bluetooth)
 # ядро: tools/bundle_core.py (колёса + PyYAML + список файлов ядра) → /data/opt/rbx
 ssh -p 2222 root@10.1.1.13 'cd /data/opt/rbx; TZ=CET-1 /data/opt/python/bin/python3.12 -X utf8 station_host.py --selftest'
 ```

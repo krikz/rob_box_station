@@ -12,7 +12,10 @@ with tarfile.open(out, "w:gz") as t:
         for m in s:
             p = m.name.split("/", 1)[1] if "/" in m.name else ""
             if p.startswith("lib/yaml/") and m.isfile(): add(t, "site/yaml/" + p[len("lib/yaml/"):], s.extractfile(m).read()); n += 1
-    for f in open(files_list, encoding="utf-8").read().split("\n"):
+    # файлы ядра, которые трасса консоли не открывает, а хост колонки зовёт (поиск в интернете — тул робота)
+    EXTRA = ["src/rob_box_mcp_tools/rob_box_mcp_tools/tools/web_search.py"]
+    listed = [f for f in open(files_list, encoding="utf-8").read().split("\n") if f.strip()]
+    for f in listed + [os.path.join(repo, e) for e in EXTRA if os.path.join(repo, e) not in listed]:
         rel = os.path.relpath(f, repo).replace("\\", "/")
         add(t, "core/" + rel, open(f, "rb").read()); n += 1
 print("файлов", n, "архив МБ", round(os.path.getsize(out) / 2**20, 2))
