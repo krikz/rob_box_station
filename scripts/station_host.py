@@ -380,8 +380,7 @@ def device_facts() -> str:
     net = wifi_now()
     port = os.environ.get("RBX_HTTP_PORT", "8080")
     page = f"http://{net['ip']}:{port}/" if net["ip"] else "нет (нет сети)"
-    return (f"- You are a smart speaker (Yandex Station Lite hardware), not a rover: no wheels, no camera, no battery "
-            f"(mains powered).\n- Wi-Fi network: {net['ssid'] or 'none'}; IP address: {net['ip'] or 'none'}.\n"
+    return (f"- Wi-Fi network: {net['ssid'] or 'none'}; IP address: {net['ip'] or 'none'}.\n"
             f"- Settings page (keys, prompt, Wi-Fi, voice): {page}. Saving needs the Alice button press first.\n"
             "- Say an IP address by its number groups, as people read it aloud (10.1.1.13 → «десять, один, один, "
             "тринадцать»).")
@@ -411,8 +410,36 @@ def install_station_tools(stand) -> None:
     def perception(args: dict) -> tuple:
         return False, {"status": "rejected", "reason": "unavailable", "detail": "у колонки нет камеры"}
 
+    def volume(args: dict) -> tuple:
+        """Громкость голоса — настоящая (``amixer``), как кнопки; проценты — по шкале кнопок."""
+        old = STATION_STATE["volume"]
+        action = str(args.get("action") or "")
+        if action == "set" and str(args.get("level", "")).lstrip("-").isdigit():
+            new = VOL_MIN + int(args["level"]) * (VOL_MAX - VOL_MIN) // 100
+        else:
+            new = {"louder": old + VOL_STEP, "quieter": old - VOL_STEP, "max": VOL_MAX, "normal": int(VOLUME)}.get(
+                action, old)
+        new = max(VOL_MIN, min(VOL_MAX, new))
+        subprocess.run(["amixer", "-q", "sset", "Master", str(new)], check=False)
+        STATION_STATE["volume"] = new
+        pct = lambda v: round(100 * (v - VOL_MIN) / (VOL_MAX - VOL_MIN))  # noqa: E731
+        log(f"🔈 громкость голосом: {old} → {new}")
+        return True, {"status": "done", "old_volume": pct(old), "new_volume": pct(new)}
+
+    def unavailable(what: str):
+        def handler(args: dict) -> tuple:
+            return False, {"status": "rejected", "reason": "unavailable", "detail": f"на колонке нет: {what}"}
+        return handler
+
     tools._t_get_robot_status, tools._t_get_battery_level = status, battery
     tools._t_get_perception_context = perception
+    tools._t_set_volume = volume
+    # Заглушки стенда консоли рапортуют «готово» за то, чего у колонки нет (музыка, лицо, звуки) — честный отказ.
+    for name, what in (("request_music", "музыки"), ("generate_music", "музыки"), ("music_library", "музыки"),
+                       ("dj_set", "музыки"), ("set_music_volume", "музыки"), ("play_animation", "лица и анимаций"),
+                       ("play_sound", "библиотеки звуков"), ("get_sound_info", "библиотеки звуков"),
+                       ("search_web", "интернет-поиска")):
+        setattr(tools, f"_t_{name}", unavailable(what))
 
 
 def make_stand(args: argparse.Namespace):
@@ -587,46 +614,90 @@ class LiveOut:
 
 
 class Ring:
-    """Кольцо из трёх RGB-диодов (``/sys/class/leds/micro:{red,green,blue}:ring{1,2,3}``): состояние колонки цветом."""
+    """Кольцо из трёх RGB-диодов (``/sys/class/leds/micro:{red,green,blue}:ring{1,2,3}``): состояние колонки эффектом,
+    как у Алисы, а не одним цветом. Кадры считает цикл asyncio (~12 в секунду); в sysfs пишется только то, что
+    изменилось. Эффекты: слушаю — синее дыхание, думаю — фиолетовый огонёк бежит по кругу, говорю — зелёная пульсация,
+    микрофон выкл — ровный красный, громкость — белые диоды по уровню на 1,2 с."""
 
     COLORS = {"off": (0, 0, 0), "listen": (0, 0, 1), "think": (1, 0, 1), "speak": (0, 1, 0), "muted": (1, 0, 0)}
+    FPS = 12
 
     def __init__(self, mic: Mic | None) -> None:
         self._mic = mic
         self.state = "off"
         self._warned = False
+        self._last: dict = {}
+        self._override: tuple | None = None  # (rgb, сколько диодов, до какого времени) — громкость
+        self._since = time.monotonic()
+        try:
+            self._task = asyncio.get_running_loop().create_task(self._run())
+        except RuntimeError:  # без цикла (тесты, --say) — без анимации
+            self._task = None
 
-    def _write(self, rgb: tuple, lit: int = 3) -> None:
-        for i in (1, 2, 3):
+    def _led(self, color: str, i: int, value: int) -> None:
+        key = (color, i)
+        if self._last.get(key) == value:
+            return
+        try:
+            with open(f"/sys/class/leds/micro:{color}:ring{i}/brightness", "w") as led:
+                led.write(str(value))
+            self._last[key] = value
+        except OSError as exc:
+            if not self._warned:
+                log(f"LED недоступны: {exc}")
+                self._warned = True
+
+    def _frame(self, t: float) -> list:
+        """Яркость (0..1) каждого из трёх диодов и цвет для текущего состояния в момент ``t`` от начала эффекта."""
+        import math  # noqa: PLC0415
+
+        if self.state == "listen":
+            k = 0.25 + 0.75 * (0.5 - 0.5 * math.cos(2 * math.pi * t / 1.6))
+            return [k, k, k]
+        if self.state == "think":
+            head = (t / 0.9 * 3) % 3  # огонёк обходит три диода за 0,9 с
+            return [max(0.12, 1 - min(abs(i - head), 3 - abs(i - head))) for i in range(3)]
+        if self.state == "speak":
+            k = 0.45 + 0.55 * (0.5 - 0.5 * math.cos(2 * math.pi * t / 0.7))
+            return [k, k, k]
+        return [1.0, 1.0, 1.0] if self.state == "muted" else [0.0, 0.0, 0.0]
+
+    def _paint(self, rgb: tuple, levels: list) -> None:
+        for i, k in enumerate(levels, start=1):
             for color, on in zip(("red", "green", "blue"), rgb):
-                value = LED_BRIGHT if on and i <= lit else 0
-                try:
-                    with open(f"/sys/class/leds/micro:{color}:ring{i}/brightness", "w") as led:
-                        led.write(str(value))
-                except OSError as exc:
-                    if not self._warned:
-                        log(f"LED недоступны: {exc}")
-                        self._warned = True
-                    return
+                self._led(color, i, int(LED_BRIGHT * k) if on else 0)
+
+    async def _run(self) -> None:
+        while True:
+            now = time.monotonic()
+            if self._override and now < self._override[2]:
+                rgb, lit, _ = self._override
+                self._paint(rgb, [1.0 if i < lit else 0.0 for i in range(3)])
+            else:
+                self._override = None
+                self._paint(self.COLORS[self.state], self._frame(now - self._since))
+            still = self._override is None and self.state in ("off", "muted")  # без анимации — реже просыпаться
+            await asyncio.sleep(0.2 if still else 1 / self.FPS)
 
     def set(self, state: str) -> None:
+        if state != self.state:
+            self._since = time.monotonic()
         self.state = state
-        self._write(self.COLORS[state])
+        if self._task is None:
+            self._paint(self.COLORS[state], self._frame(0.0))
 
     def idle(self) -> None:
         self.set("muted" if self._mic is not None and self._mic.user_muted else "off")
 
     def flash(self, state: str, seconds: float = 3.0) -> None:
-        """Показать состояние цветом на время (итог смены Wi-Fi) и вернуть покой."""
+        """Показать состояние на время (итог смены Wi-Fi) и вернуть покой."""
         self.set(state)
         asyncio.get_running_loop().call_later(seconds, self.idle)
 
     def level(self, volume: int) -> None:
-        """Громкость белым: 1–3 диода по уровню, через 1,2 с — обратно прежнее состояние."""
+        """Громкость белым: 1–3 диода по уровню на 1,2 с, потом — прежний эффект."""
         lit = 1 + round(2 * (volume - VOL_MIN) / (VOL_MAX - VOL_MIN))
-        self._write((1, 1, 1), lit)
-        state = self.state
-        asyncio.get_running_loop().call_later(1.2, lambda: self.set(state) if self.state == state else None)
+        self._override = ((1, 1, 1), lit, time.monotonic() + 1.2)
 
 
 class Keys:
@@ -674,7 +745,12 @@ class Buttons:
         self.armed_until = 0.0
 
     def on_key(self, code: int) -> None:
+        if self.auth is not None:
+            # окно настройки (Improv по Bluetooth, страница) — любой кнопкой: важно, что человек рядом с колонкой;
+            # 07.11 Шифу искал «авторизационную кнопку» и нажал микрофон
+            self.auth.grant()
         if code in (KEY_VOL_UP, KEY_VOL_DOWN):
+            self.volume = STATION_STATE["volume"]  # голосом её мог поменять set_volume
             self._volume(VOL_STEP if code == KEY_VOL_UP else -VOL_STEP)
         elif code == KEY_MUTE:
             self._mic.user_muted = not self._mic.user_muted
@@ -696,8 +772,6 @@ class Buttons:
         log(f"🔘 громкость {self.volume}")
 
     def _action(self) -> None:
-        if self.auth is not None:
-            self.auth.grant()  # окно настройки: Improv по Bluetooth и страница
         if self._live.busy():
             self._live.stop()
             log("🔘 стоп: речь оборвана кнопкой")

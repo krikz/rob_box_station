@@ -2,13 +2,14 @@
 
 * **Improv Wi-Fi по BLE** (https://www.improv-wifi.com/ble/): GATT-сервис через BlueZ D-Bus (``bluetoothd -E``,
   ``dbus-next``). С телефона на Android — Chrome, страница improv-wifi.com, кнопка «Connect». Колонка просит
-  подтверждения кнопкой Алисы (состояние «нужна авторизация»), потом принимает имя сети и пароль.
+  подтверждения любой кнопкой колонки (состояние «нужна авторизация»), потом принимает имя сети и пароль.
 * **Смена сети без риска потерять колонку**: новая сеть добавляется к сохранённым (``wpa_cli add_network``) с
   приоритетом выше прочих; старые не выключаются. Не подключилась за ``WIFI_WAIT_S`` — сеть удаляется, колонка
   возвращается в прежнюю сама.
 * **Страница настроек** ``http://<колонка>:8080/``: вейк, голос, громкость, яркость кольца, ключи LLM/TTS (видны
   только последние 4 знака), промпт (основа + дополнение колонки, свои копии — ``Prompts``), смена сети Wi-Fi (тем же
-  безопасным ``connect_wifi``). Сохранение — только в окно после кнопки Алисы (как Improv): чужой в сети не сменит.
+  безопасным ``connect_wifi``). Сохранение — только в окно после нажатия любой кнопки колонки (как Improv): чужой
+  в сети не сменит.
 
 Чистые функции (разбор пакетов Improv, проверка настроек, форма) — без D-Bus, их гоняет ``tests/test_station_setup.py``.
 """
@@ -32,7 +33,7 @@ AUTH_REQUIRED, AUTHORIZED, PROVISIONING, PROVISIONED = 1, 2, 3, 4
 ERR_NONE, ERR_INVALID, ERR_UNKNOWN_CMD, ERR_CONNECT, ERR_NOT_AUTHORIZED, ERR_UNKNOWN = 0, 1, 2, 3, 4, 0xFF
 CMD_WIFI, CMD_IDENTIFY = 1, 2
 CAP_IDENTIFY = 0x01
-#: Окно после кнопки Алисы, когда можно настраивать (Improv и страница).
+#: Окно после нажатия любой кнопки колонки, когда можно настраивать (Improv и страница).
 AUTH_S = 60.0
 WIFI_WAIT_S = 30.0
 HTTP_PORT = int(os.environ.get("RBX_HTTP_PORT", "8080"))
@@ -141,7 +142,7 @@ async def connect_wifi(ssid: str, password: str, log: Callable[[str], None]) -> 
 
 
 class Auth:
-    """Окно настройки после кнопки Алисы: Improv и страница пишут только в него."""
+    """Окно настройки после нажатия любой кнопки колонки: Improv и страница пишут только в него."""
 
     def __init__(self) -> None:
         self.until = 0.0
@@ -332,7 +333,7 @@ def render_page(settings: Dict[str, str], env: Dict[str, str], note: str = "", p
     return f"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Колонка Игорёк</title>
 <style>{STYLE}</style></head><body><h1>Колонка «Игорёк»</h1>{msg}
-<p>Чтобы сохранить что-либо: нажми кнопку Алисы на колонке, потом кнопку на странице (на это минута).</p>
+<p>Чтобы сохранить что-либо: нажми любую кнопку на колонке, потом кнопку на странице (на это минута).</p>
 <h2>Основное</h2><form method="post" action="/save">
 {field("Вейк-слова (через запятую)", "wake", settings.get("RBX_WAKE", ""))}
 <label>Голос<select name="voice">{voices}</select></label>
@@ -347,7 +348,7 @@ def render_page(settings: Dict[str, str], env: Dict[str, str], note: str = "", p
 
 class SettingsServer:
     """Страница настроек: ``GET /`` — формы; ``POST /save`` (основное), ``/prompt`` (промпт), ``/wifi`` (сеть).
-    Любая запись — только в окно после кнопки Алисы (``Auth``)."""
+    Любая запись — только в окно после нажатия любой кнопки колонки (``Auth``)."""
 
     BODY_MAX = 262144  # промпт кириллицей в urlencoded раздувается ×6
 
@@ -404,7 +405,7 @@ class SettingsServer:
             return "404 Not Found", "not found"
         form = {k: v[0] for k, v in urllib.parse.parse_qs(body.decode("utf-8"), keep_blank_values=True).items()}
         if not self.auth.ok():
-            return "403 Forbidden", await self._page("Не сохранено: нажми кнопку Алисы на колонке и повтори.")
+            return "403 Forbidden", await self._page("Не сохранено: нажми любую кнопку на колонке и повтори.")
         try:
             note = {"/save": self._save, "/prompt": self._prompt, "/wifi": self._wifi}[target](form)
         except ValueError as exc:
