@@ -411,6 +411,12 @@ KWS_CAP_BYTES = int(os.environ.get("RBX_KWS_CAP_MB", "10")) * 2**20
 #: параллельно с облачным STT и пишет ответ в лог — решение ещё за облаком (сравнить на живой речи, потом доверять).
 KWS_BIN = BASE / "kws" / "kws_run"
 KWS_MODEL = BASE / "kws" / "kws_model.bin"
+#: Своя модель решает вейк (а не только пишет в лог): ``RBX_KWS_DECIDE=1``. Читается при каждом ходе —
+#: можно включить в ``.env`` (страница его не перетирает) или в ``settings.json`` и перезапустить хост.
+#: Порог — ``RBX_KWS_THRESHOLD`` (дефолт 0,8; на живых замерах 0,6 даёт recall 90,2 % при ложных 0,8 %).
+KWS_WAKE_LABEL = "igorek"
+#: Что сказать, если модель услышала вейк, а облако текст не разобрало.
+KWS_HEARD_PHRASE = "Слушаю."
 
 
 def kws_score(pcm: bytes) -> tuple:
@@ -423,6 +429,33 @@ def kws_score(pcm: bytes) -> tuple:
         return out[0], float(out[1])
     except (OSError, subprocess.TimeoutExpired, IndexError, ValueError):
         return "", 0.0
+
+
+def kws_wake(label: str, prob: float) -> bool:
+    """Своя модель услышала вейк с достаточной уверенностью и ей разрешено решать (``RBX_KWS_DECIDE=1``).
+
+    По умолчанию режим тени: модель считает и пишет ``🔑 kws`` в лог, решение остаётся за облачным STT.
+    """
+    if os.environ.get("RBX_KWS_DECIDE", "0").strip().lower() in ("0", "", "off", "false", "no"):
+        return False
+    try:
+        threshold = float(os.environ.get("RBX_KWS_THRESHOLD", "0.8"))
+    except ValueError:
+        threshold = 0.8
+    return label == KWS_WAKE_LABEL and prob >= threshold
+
+
+def kws_wake_text(text: str, label: str, prob: float) -> str:
+    """Модель услышала вейк, а STT его не разобрал — код подставляет вейк сам (ADR-0148: решает код).
+
+    Ядро считает фразу адресованной по тексту (``stand.wake``), поэтому без подстановки распознанный
+    «Горек, который час» остался бы ``no_wake``, хотя модель уверена, что это вейк.
+    """
+    words = [w.strip(",.!?").lower() for w in text.split()]
+    if not kws_wake(label, prob) or (words and words[0] in WAKE_WORDS) or set(words) & set(WAKE_WORDS):
+        return text
+    log(f"🔑 вейк по модели ({label} {prob:.2f}) — подставляю «{WAKE_WORDS[0]}»")
+    return f"{WAKE_WORDS[0]}, {text}"
 
 
 def kws_collect(pcm: bytes, text: str) -> None:
@@ -657,8 +690,15 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
                     log("STT 429 — пауза 20 с")
                     await asyncio.sleep(20)
                     mic.flush()
+                elif kws_wake(label, prob):
+                    # облако текст не дало, но своя модель услышала вейк — отвечаем коротко, чтобы человек не гадал
+                    live.begin(t1)
+                    live.earcon()
+                    live.speak(KWS_HEARD_PHRASE)
+                    await live.drain()
+                    mic.flush()
                 continue
-            text = buttons.address(text)
+            text = buttons.address(kws_wake_text(text, label, prob))
             live.begin(t1)
             words = text.split()
             if words and words[0].lower().strip(",.!?") in WAKE_WORDS:
@@ -683,6 +723,7 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
                     await live.drain()
                     mic.flush()
                     continue
+            log(f"🧠 окно до хода: записей {len(stand.engine.log.window())}, токенов {stand.engine.log.tokens()}")
             result = await stand.hear(text, chat.CONSOLE_VOICE, source=chat.SOURCE_VOICE)
             t3 = time.time()
             if not result.addressed:
@@ -692,6 +733,7 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
                 if any(k in line for k in ("violation", "bad_", "repair", "rejected", "fields_dropped")):
                     log(f"   ядро: {line[:300]}")
             log(f"ход {t3 - t2:.2f} с: {result.said}")
+            log(f"🧠 окно после хода: записей {len(stand.engine.log.window())}, токенов {stand.engine.log.tokens()}")
             await live.drain()
             if wordless_tail(ring, result):
                 log(f"🎤 ход без слов — слушаю дальше {ARM_S:.0f} с")
