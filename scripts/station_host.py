@@ -59,6 +59,10 @@ WAKE_WORDS = [w.strip() for w in os.environ.get(
     "RBX_WAKE", ",".join(WAKE_DEFAULT)).split(",") if w.strip()]
 START_FRAMES, END_SILENCE_S, MIN_S, MAX_S = 5, 0.8, 0.7, 12.0
 TTS_FORMAT, TTS_RATE = "pcm_24000", 24000
+#: 429 от MiniMax STT: провайдер режет одновременные запросы (08.11: две колонки на одном ключе).
+#: Повтор с паузой дешевле молчания — 20 с паузы хост делает только если все попытки отбились.
+STT_429_TRIES = int(os.environ.get("RBX_STT_429_TRIES", "3"))
+STT_429_PAUSE = float(os.environ.get("RBX_STT_429_PAUSE", "0.6"))
 #: Потоковый синтез (SSE MiniMax): звук играет с первого куска, а не после всей фразы. 0 — целым куском (сравнение).
 TTS_STREAM = os.environ.get("RBX_TTS_STREAM", "1") != "0"
 #: Запас звука перед стартом ``aplay`` в потоке: куски SSE приходят неровно, без запаса речь рвётся.
@@ -302,12 +306,21 @@ class Voice:
             MiniMaxSTTError, MiniMaxSTTRateLimitError)
 
         self.limited = False
-        try:
-            return (self.stt.transcribe(wav_bytes(pcm)).text or "").strip()
-        except MiniMaxSTTRateLimitError:
-            self.limited = True
-        except MiniMaxSTTError as exc:
-            log(f"STT ошибка: {type(exc).__name__}")
+        wav = wav_bytes(pcm)
+        for attempt in range(STT_429_TRIES):
+            try:
+                return (self.stt.transcribe(wav).text or "").strip()
+            except MiniMaxSTTRateLimitError:
+                # 429 у MiniMax транзиентный: 08.11 две колонки на одном ключе по очереди получали отказ.
+                # Переждать дешевле, чем молчать 20 с: пауза растёт 0,6 -> 1,2 с.
+                if attempt + 1 >= STT_429_TRIES:
+                    self.limited = True
+                    break
+                log(f"STT 429 — повтор {attempt + 2}/{STT_429_TRIES}")
+                time.sleep(STT_429_PAUSE * (attempt + 1))
+            except MiniMaxSTTError as exc:
+                log(f"STT ошибка: {type(exc).__name__}")
+                break
         return ""
 
 
@@ -683,6 +696,7 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
             mic.flush()
     finally:
         live.close()
+        ring.idle()  # что бы ни случилось в цикле, кольцо не должно остаться в «думаю»/«говорю»
         mic.proc.kill()
         stand.close()
 
@@ -783,6 +797,10 @@ class LiveOut:
 
     async def drain(self) -> None:
         await self._queue.join()
+        # Ход без реплики (адресовано, но `said` пуст) ничего не кладёт в очередь — `_play` не проснётся,
+        # и кольцо останется в «думаю» навсегда (08.11: «Игорёк, задумался» — think висел 3 минуты).
+        if self._ring and self._queue.empty():
+            self._ring.idle()
 
     def close(self) -> None:
         self._player.cancel()
