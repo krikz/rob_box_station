@@ -38,8 +38,11 @@ AUTH_S = 60.0
 WIFI_WAIT_S = 30.0
 HTTP_PORT = int(os.environ.get("RBX_HTTP_PORT", "8080"))
 #: Ключи, которые правятся со страницы (имена из ``scripts/dialogue/.env`` колонки).
-#: GITHUB_TOKEN — обновления закрытого репо; YANDEX_API_KEY — распознавание и синтез Яндекса; JEV_API_KEY — чойсер.
-KEY_NAMES = ("DEEPSEEK_API_KEY", "MINIMAX_API_KEY", "MINIMAX_GROUP_ID", "YANDEX_API_KEY", "JEV_API_KEY", "GITHUB_TOKEN")
+#: GITHUB_TOKEN — обновления закрытого репо (только чтение); GH_ISSUE_TOKEN — жалоба в GitHub («пожалуйся»):
+#: отдельный fine-grained, право Issues: Read and write только на krikz/rob_box_station.
+#: YANDEX_API_KEY — распознавание и синтез Яндекса; JEV_API_KEY — чойсер.
+KEY_NAMES = ("DEEPSEEK_API_KEY", "MINIMAX_API_KEY", "MINIMAX_GROUP_ID", "YANDEX_API_KEY", "JEV_API_KEY", "GITHUB_TOKEN",
+             "GH_ISSUE_TOKEN")
 #: Голоса MiniMax для выбора на странице (id → как назвать); пусто — голос по умолчанию.
 VOICES = {"": "по умолчанию", "Russian_ReliableMan": "Надёжный мужчина", "Russian_BrightHeroine": "Яркая героиня",
           "Russian_AttractiveGuy": "Обаятельный парень", "Russian_AmbitiousWoman": "Целеустремлённая женщина",

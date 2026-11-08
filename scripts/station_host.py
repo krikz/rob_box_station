@@ -659,6 +659,7 @@ async def one_turn(voice: Voice, args: argparse.Namespace) -> None:
 
 async def serve(voice: Voice, args: argparse.Namespace) -> None:
     import station_bt  # noqa: PLC0415  (Bluetooth-музыка: сопряжение и пульт плеера телефона)
+    import station_report  # noqa: PLC0415  (жалоба в GitHub: «пожалуйся» → issue с логом)
     import station_update  # noqa: PLC0415  (обновление колонки с GitHub по тегу)
 
     chat, stand = make_stand(args)
@@ -670,6 +671,7 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
     buttons = Buttons(mic, ring, live)
     bt = station_bt.BtMedia(log)
     updater = station_update.Updater(BASE, lambda: os.environ.get("GITHUB_TOKEN", ""), log)
+    reporter = station_report.Reporter(BASE, lambda: os.environ.get("GH_ISSUE_TOKEN", ""), log)
     asyncio.get_running_loop().call_later(30, station_update.OK_MARK.touch)  # «здоров» — сторож отката не нужен
     log(f"версия колонки: {updater.current()}")
     Keys(asyncio.get_running_loop(), buttons.on_key)
@@ -714,6 +716,13 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
                     await live.drain()
                     if done.startswith("Обновляюсь"):
                         restart_self(mic, "обновление")
+                    mic.flush()
+                    continue
+                action, complaint = station_report.report_command(" ".join(words[1:]))
+                if action:  # жалоба: текст issue собирает код, модель в этом не участвует
+                    live.earcon()
+                    live.speak(await asyncio.to_thread(reporter.file, complaint, action == "file"))
+                    await live.drain()
                     mic.flush()
                     continue
                 reply = await bt.handle(" ".join(words[1:]))
