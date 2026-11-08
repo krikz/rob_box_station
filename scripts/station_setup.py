@@ -42,7 +42,8 @@ HTTP_PORT = int(os.environ.get("RBX_HTTP_PORT", "8080"))
 KEY_NAMES = ("DEEPSEEK_API_KEY", "MINIMAX_API_KEY", "MINIMAX_GROUP_ID", "YANDEX_API_KEY", "JEV_API_KEY", "GITHUB_TOKEN")
 #: Голоса MiniMax для выбора на странице (id → как назвать); пусто — голос по умолчанию.
 VOICES = {"": "по умолчанию", "Russian_ReliableMan": "Надёжный мужчина", "Russian_BrightHeroine": "Яркая героиня",
-          "Russian_AttractiveGuy": "Обаятельный парень", "Russian_AmbitiousWoman": "Целеустремлённая женщина"}
+          "Russian_AttractiveGuy": "Обаятельный парень", "Russian_AmbitiousWoman": "Целеустремлённая женщина",
+          "English_Jovialman": "Весельчак"}  # голос Саши у робота: каталог MiniMax английский, русский читает
 
 
 # ---------------------------------------------------------------- Improv: пакеты
