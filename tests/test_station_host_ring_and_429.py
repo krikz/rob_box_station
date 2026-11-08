@@ -134,3 +134,38 @@ def test_turn_with_speech_does_not_touch_ring():
 
     assert asyncio.run(run()) is False
     assert ring.states == []
+
+
+def test_kws_wake_shadow_by_default(monkeypatch):
+    """По умолчанию модель только пишет в лог: уверенный вейк не решает за облако."""
+    monkeypatch.delenv("RBX_KWS_DECIDE", raising=False)
+
+    assert sh.kws_wake("igorek", 0.99) is False
+
+
+def test_kws_wake_respects_threshold(monkeypatch):
+    monkeypatch.setenv("RBX_KWS_DECIDE", "1")
+    monkeypatch.setenv("RBX_KWS_THRESHOLD", "0.8")
+
+    assert sh.kws_wake("igorek", 0.81) is True
+    assert sh.kws_wake("igorek", 0.79) is False
+    assert sh.kws_wake("_unknown_", 0.99) is False
+
+
+def test_kws_wake_text_prefixes_missing_wake(monkeypatch):
+    """STT не разобрал вейк, модель уверена — код подставляет вейк, иначе ядро скажет no_wake."""
+    monkeypatch.setenv("RBX_KWS_DECIDE", "1")
+    wake = sh.WAKE_WORDS[0]
+
+    assert sh.kws_wake_text("Горек, который час?", "igorek", 0.95) == f"{wake}, Горек, который час?"
+    assert sh.kws_wake_text("который час?", "igorek", 0.95) == f"{wake}, который час?"
+
+
+def test_kws_wake_text_keeps_existing_wake(monkeypatch):
+    """Вейк уже в тексте — не дублируем; режим тени — текст не трогаем."""
+    monkeypatch.setenv("RBX_KWS_DECIDE", "1")
+    text = f"{sh.WAKE_WORDS[0]}, как дела"
+
+    assert sh.kws_wake_text(text, "igorek", 0.95) == text
+    monkeypatch.setenv("RBX_KWS_DECIDE", "0")
+    assert sh.kws_wake_text("который час?", "igorek", 0.95) == "который час?"
