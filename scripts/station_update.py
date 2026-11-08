@@ -1,13 +1,15 @@
 """Обновление колонки с GitHub по тегу (Шифу 07.11: «обновление колонки с гита», голосом «проверь обновление»).
 
 Тянется код колонки — релиз (тег) ``krikz/rob_box_station``: ``scripts/*.py``, ``assets/``. Промпт и настройки
-пользователя (``prompts/``, ``settings.json``, ``.env``) не трогаются. Закрытый репозиторий — нужен токен только
-на чтение (``GITHUB_TOKEN`` в ``.env``, вводится на странице настроек); открытый — работает без токена.
+пользователя (``prompts/``, ``settings.json``, ``.env``) не трогаются. Токен не нужен: репозиторий публичный, а
+негодный токен не мешает — чтение повторяется анонимно (``_get``). Токен на чтение (``GITHUB_TOKEN`` в ``.env``)
+нужен, только если репозиторий закроют.
 
 Перед установкой — проверка места: свободно не меньше 3× архива + 2 МБ, иначе отказ словами.
 Порядок: старые файлы → ``prev/``, новые — на место, ``VERSION`` = тег, перезапуск хоста. Сторож (отдельный процесс,
-``setsid``) через ``WATCH_S`` проверяет метку ``/tmp/rbx_update_ok`` (хост ставит её, когда слушает и прожил 30 с);
-нет метки — возвращает ``prev/`` и перезапускает хост. Ядро (``core/``) — пока отдельно (ADR-0167 Ш2).
+``setsid``) взводится хостом **в момент перезапуска** (``arm_watchdog``) и через ``WATCH_S`` проверяет метку
+``/tmp/rbx_update_ok`` (хост ставит её, когда слушает и прожил 30 с); нет метки — возвращает ``prev/`` и
+перезапускает хост. Ядро (``core/``) — пока отдельно (ADR-0167 Ш2).
 """
 import io
 import json
@@ -15,6 +17,7 @@ import os
 import shutil
 import subprocess
 import tarfile
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Callable, Optional, Tuple
@@ -26,13 +29,25 @@ UPDATED = ("scripts/", "assets/")  # что берётся из релиза (sc
 
 
 def _get(url: str, token: str, accept: str = "application/vnd.github+json") -> bytes:
+    """Прочитать URL с GitHub. Негодный токен не валит чтение: публичный репозиторий отдаётся и без него."""
+    headers = {"Accept": accept, "User-Agent": "rbx-station"}
+    if token:  # закрытый репо — токен на чтение; открытый — без токена (лимит GitHub 60 запросов в час)
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        return _read(url, headers)
+    except urllib.error.HTTPError as exc:
+        # 08.11: в поле токена оказался отозванный токен — GitHub отвечал 401, и обновление «не проверялось».
+        # Публичный репозиторий читается анонимно, поэтому повторяем без заголовка; закрытый отдаст 404.
+        if not token or exc.code not in (401, 403):
+            raise
+        return _read(url, {"Accept": accept, "User-Agent": "rbx-station"})
+
+
+def _read(url: str, headers: dict) -> bytes:
     import ssl  # noqa: PLC0415
 
     import certifi  # noqa: PLC0415
 
-    headers = {"Accept": accept, "User-Agent": "rbx-station"}
-    if token:  # закрытый репо — токен на чтение; открытый — без токена (лимит GitHub 60 запросов в час)
-        headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=30, context=ssl.create_default_context(cafile=certifi.where())) as r:
         return r.read()
@@ -57,6 +72,8 @@ class Updater:
             self.log(f"⬆ проверка обновления: {type(exc).__name__}: {exc}")
             if not token and "404" in str(exc):  # закрытый репо без токена GitHub отвечает 404
                 return None, "Репозиторий закрытый: для обновлений впиши токен гитхаба на странице настроек."
+            if getattr(exc, "code", None) in (401, 403):
+                return None, "Гитхаб не принял токен: очисти поле с токеном или впиши рабочий."
             return None, "Не смог проверить обновление: гитхаб не ответил."
         names = [t["name"] for t in tags if str(t.get("name", "")).startswith("v")]
         if not names:
@@ -112,12 +129,20 @@ class Updater:
             shutil.copy2(self.base / "VERSION", prev / "VERSION")
         (self.base / "VERSION").write_text(tag + "\n", encoding="utf-8")
         OK_MARK.unlink(missing_ok=True)
-        self._watchdog()
-        self.log(f"⬆ поставлена {tag}: {len(placed)} файлов, старое — в prev/, сторож {WATCH_S} с")
+        self.log(f"⬆ поставлена {tag}: {len(placed)} файлов, старое — в prev/")
         return f"Обновляюсь до {tag}, через минуту вернусь."
 
+    def arm_watchdog(self) -> None:
+        """Взвести сторожа отката. Зовёт хост в момент перезапуска, а не распаковка.
+
+        08.11 на 10.1.1.141: сторож спал с момента распаковки и за 90 с не дождался метки — потому что в это же
+        окно попала озвучка «Обновляюсь до …» (56 с на тормозящем MiniMax), перезапуск и 30 с до метки. Откат
+        съел удачную установку. Теперь окно начинается там, где колонка уже всё сказала.
+        """
+        self._watchdog()
+
     def _watchdog(self) -> None:
-        """Отдельный процесс: нет метки здоровья за ``WATCH_S`` — вернуть ``prev/`` и перезапустить хост."""
+        """Отдельный процесс: нет метки здоровья за ``WATCH_S`` от перезапуска — вернуть ``prev/`` и перезапустить."""
         script = (f"sleep {WATCH_S}; [ -f {OK_MARK} ] && exit 0; "
                   f"cp -a {self.base}/prev/. {self.base}/ && echo \"$(date) откат обновления\" >> /tmp/station.log; "
                   "/etc/init.d/S99zzzrbxhost restart")

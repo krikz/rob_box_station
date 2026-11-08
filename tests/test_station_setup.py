@@ -118,6 +118,15 @@ def test_empty_base_without_reset_is_refused(tmp_path):
         ss.Prompts(tmp_path, tmp_path / "own").save("  ", "", reset=False)
 
 
+def test_page_has_issue_token_but_no_update_token():
+    """08.11: токен для карточек клали в поле обновлений и ломали обновления — поля обновлений на странице нет."""
+    page = ss.render_page({"RBX_WAKE": "игорёк"}, {})
+
+    assert "GH_ISSUE_TOKEN" in page
+    assert "GITHUB_TOKEN" not in page
+    assert "GH_ISSUE_TOKEN" in ss.KEY_NAMES and "GITHUB_TOKEN" not in ss.KEY_NAMES
+
+
 def test_scan_ssids_sorted_unique_no_hidden():
     text = ("bssid / frequency / signal level / flags / ssid\n"
             "aa\t2412\t-70\t[WPA2]\tROS2\nbb\t2437\t-40\t[WPA2]\tМастерская\ncc\t2412\t-50\t[WPA2]\tROS2\n"

@@ -715,6 +715,7 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
                         live.speak(done or "Не смог скачать обновление, попробуй позже.")
                     await live.drain()
                     if done.startswith("Обновляюсь"):
+                        updater.arm_watchdog()  # окно сторожа начинается здесь: озвучка уже позади (08.11: откат)
                         restart_self(mic, "обновление")
                     mic.flush()
                     continue
