@@ -693,6 +693,8 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
                     log(f"   ядро: {line[:300]}")
             log(f"ход {t3 - t2:.2f} с: {result.said}")
             await live.drain()
+            if wordless_tail(ring, result):
+                log(f"🎤 ход без слов — слушаю дальше {ARM_S:.0f} с")
             mic.flush()
     finally:
         live.close()
@@ -1114,6 +1116,20 @@ def wifi_done(ok: bool, ring: "Ring", mic: Mic) -> None:
     ring.flash("speak" if ok else "muted")
     if ok:
         asyncio.get_running_loop().call_later(4.0, restart_self, mic, "сеть Wi-Fi")
+
+
+def wordless_tail(ring: "Ring | None", result) -> bool:
+    """Ход без слов (ядро: ``Addressed("", BARE_WAKE)`` — голое «Игорёк»): показать, что продолжаем слушать.
+
+    08.11 Шифу: «на Игорька он булькает, но молчит» — кольцо гасилось сразу после earcon, и человек
+    не понимал, ждут его или нет. Отвечать голосом на голое имя не надо (в ядре это штатный пустой ход),
+    но кольцо должно держать «слушаю» столько же, сколько кнопка (``ARM_S``).
+    """
+    if ring is None or not getattr(result, "addressed", False) or getattr(result, "said", None):
+        return False
+    ring.set("listen")
+    asyncio.get_running_loop().call_later(ARM_S, ring.idle)
+    return True
 
 
 async def serve_setup_only() -> None:
