@@ -22,10 +22,106 @@ def posted(monkeypatch):
     return calls
 
 
-def _reporter(tmp_path, token="gh-token", log_paths=(), logs=None):
+def _reporter(tmp_path, token="gh-token", log_paths=(), logs=None, format_with=None):
     (tmp_path / "VERSION").write_text("v0.1.9\n", encoding="utf-8")
     logs = [] if logs is None else logs
-    return sr.Reporter(tmp_path, lambda: token, logs.append, log_paths=list(log_paths))
+    return sr.Reporter(tmp_path, lambda: token, logs.append, log_paths=list(log_paths), format_with=format_with)
+
+
+MODEL_TITLE = "колонка: не слышит после вопроса про новости"
+MODEL_BODY = (
+    "Жалоба с колонки, голосом:\n\n> не слышит после вопроса про новости\n\n"
+    "## Что случилось\nПосле вопроса про новости колонка переспросила, о чём речь.\n\n"
+    "## Что видно в логе\n```\nход: переспросила, о чём речь\n```\n\n"
+    "## Устройство\n- версия: v0.1.9\n- громкость: 230\n"
+)
+
+
+def test_draft_uses_model_when_answer_passes_checks(tmp_path, monkeypatch):
+    """Модель оформила — берём её заголовок и тело (жалоба в теле дословно, числа из фактов)."""
+    import json as _json
+
+    monkeypatch.setenv("RBX_VOLUME", "230")
+    answer = _json.dumps({"title": MODEL_TITLE, "body": MODEL_BODY}, ensure_ascii=False)
+    title, body = _reporter(tmp_path, format_with=lambda facts: answer).draft("не слышит после вопроса про новости",
+                                                                              with_log=False)
+
+    assert title == MODEL_TITLE
+    assert "## Что случилось" in body and "> не слышит после вопроса про новости" in body
+
+
+def test_draft_rejects_invented_numbers(tmp_path):
+    """Число, которого нет в фактах, — повод не верить всему ответу и взять шаблон."""
+    import json as _json
+
+    logs = []
+    answer = _json.dumps({"title": MODEL_TITLE,
+                          "body": MODEL_BODY.replace("громкость: 230", "громкость: 199")}, ensure_ascii=False)
+    title, body = _reporter(tmp_path, logs=logs, format_with=lambda facts: answer).draft(
+        "не слышит после вопроса про новости", with_log=False)
+
+    assert title == "колонка: не слышит после вопроса про новости" and "199" not in body
+    assert any("числа не из фактов" in line for line in logs)
+
+
+def test_draft_rejects_answer_without_verbatim_complaint(tmp_path):
+    import json as _json
+
+    body = MODEL_BODY.replace("> не слышит после вопроса про новости", "> колонка глючит")
+    answer = _json.dumps({"title": MODEL_TITLE, "body": body}, ensure_ascii=False)
+    title, _ = _reporter(tmp_path, format_with=lambda facts: answer).draft(
+        "не слышит после вопроса про новости", with_log=False)
+
+    assert title == "колонка: не слышит после вопроса про новости"
+
+
+def test_draft_falls_back_on_broken_json(tmp_path):
+    title, body = _reporter(tmp_path, format_with=lambda facts: "сейчас всё оформим").draft("не слышит",
+                                                                                            with_log=False)
+
+    assert title == "колонка: не слышит" and body.startswith("Жалоба с колонки")
+
+
+def test_draft_falls_back_when_model_fails(tmp_path):
+    def boom(_facts):
+        raise TimeoutError("deepseek не ответил")
+
+    title, body = _reporter(tmp_path, format_with=boom).draft("не слышит", with_log=False)
+
+    assert title == "колонка: не слышит" and body.startswith("Жалоба с колонки")
+
+
+def test_facts_carry_complaint_version_and_no_keys(tmp_path, monkeypatch):
+    monkeypatch.setenv("RBX_VOICE", "English_Jovialman")
+    facts = _reporter(tmp_path).facts("не слышит", with_log=False)
+
+    assert "не слышит" in facts and "v0.1.9" in facts and "English_Jovialman" in facts
+    assert "TOKEN" not in facts.upper() and "KEY" not in facts.upper()
+
+
+def test_title_cut_by_word_not_mid_word():
+    """08.11 в #13 заголовок кончился на «запро» — режем по границе слова."""
+    complaint = "в гитхабе по текущей ситуации, ты не смог ответить на предыдущий запрос"
+
+    title = sr.Reporter.title(complaint)
+
+    assert len(title) <= 79 and not title.endswith("запро") and title.startswith("колонка: ")
+
+
+def test_formatter_is_none_without_deepseek_key(monkeypatch):
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    assert sr.deepseek_formatter(lambda msg: None) is None
+
+
+def test_file_posts_model_drafted_title(tmp_path, posted, monkeypatch):
+    import json as _json
+
+    monkeypatch.setenv("RBX_VOLUME", "230")
+    answer = _json.dumps({"title": MODEL_TITLE, "body": MODEL_BODY}, ensure_ascii=False)
+    _reporter(tmp_path, format_with=lambda facts: answer).file("не слышит после вопроса про новости")
+
+    assert posted[0]["payload"]["title"] == MODEL_TITLE
 
 
 def test_command_words():

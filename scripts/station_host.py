@@ -671,7 +671,8 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
     buttons = Buttons(mic, ring, live)
     bt = station_bt.BtMedia(log)
     updater = station_update.Updater(BASE, lambda: os.environ.get("GITHUB_TOKEN", ""), log)
-    reporter = station_report.Reporter(BASE, lambda: os.environ.get("GH_ISSUE_TOKEN", ""), log)
+    reporter = station_report.Reporter(BASE, lambda: os.environ.get("GH_ISSUE_TOKEN", ""), log,
+                                       format_with=station_report.deepseek_formatter(log))
     asyncio.get_running_loop().call_later(30, station_update.OK_MARK.touch)  # «здоров» — сторож отката не нужен
     log(f"версия колонки: {updater.current()}")
     Keys(asyncio.get_running_loop(), buttons.on_key)
