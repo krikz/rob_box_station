@@ -58,11 +58,19 @@ def test_check_settings_ok():
                    "RBX_VOICE": "Russian_ReliableMan"}
 
 
+def test_jovialman_on_the_page():
+    """«Весельчак» (голос Саши у робота) выбирается на странице полным id каталога MiniMax."""
+    out = ss.check_settings({"wake": "игорёк", "volume": "230", "led": "60", "voice": "English_Jovialman"})
+    assert out["RBX_VOICE"] == "English_Jovialman"
+    assert "Весельчак" in ss.render_page({"RBX_WAKE": "игорёк"}, {})
+
+
 @pytest.mark.parametrize("form", [
     {"wake": "", "volume": "230", "led": "60", "voice": ""},
     {"wake": "игорёк", "volume": "999", "led": "60", "voice": ""},
     {"wake": "игорёк", "volume": "230", "led": "x", "voice": ""},
     {"wake": "игорёк", "volume": "230", "led": "60", "voice": "Hacker"},
+    {"wake": "игорёк", "volume": "230", "led": "60", "voice": "Jovialman"},
 ])
 def test_check_settings_rejects(form):
     with pytest.raises(ValueError):
