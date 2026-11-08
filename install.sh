@@ -5,8 +5,9 @@
 #   curl -sL https://raw.githubusercontent.com/krikz/rob_box_station/main/install.sh | sh -s -- 10.1.1.13
 #
 # Аргументы: IP колонки [порт SSH, 2222]. DRY_RUN=1 — только показать шаги. FORCE_RUNTIME=1 — переставить Питон и ядро.
-# Ставит: Питон + библиотеки + ядро (релиз station-runtime-armv7.tar.gz), код колонки последнего релиза, автозапуск,
+# Ставит: Питон + библиотеки + ядро (ассет station-runtime-armv7.tar.gz), код колонки последнего тега, автозапуск,
 # глушение Алисы (вернуть: rm /data/opt/yandex_off && reboot), приветствие SSH. Ключи — потом на странице настроек.
+# Переменные: TAG=vX.Y.Z — конкретный тег; RUNTIME_URL=https://… — свой адрес рунтайма; NEED_MB=NN — порог свободного места.
 set -eu
 HOST="${1:?укажи IP колонки: ... | sh -s -- 10.1.1.13}"
 PORT="${2:-2222}"
@@ -16,19 +17,44 @@ say() { printf '\033[36m▶ %s\033[0m\n' "$*"; }
 run() { if [ "${DRY_RUN:-0}" = 1 ]; then printf '  [dry] %s\n' "$*"; else sh -c "$*"; fi; }
 SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -p $PORT root@$HOST"
 
+RUNTIME_ASSET=station-runtime-armv7.tar.gz
+
+# Ассет рунтайма: RUNTIME_URL → наш тег → любой релиз репозитория с таким ассетом.
+runtime_url() {
+  if [ -n "${RUNTIME_URL:-}" ]; then printf '%s' "$RUNTIME_URL"; return 0; fi
+  u="https://github.com/$REPO/releases/download/$TAG/$RUNTIME_ASSET"
+  if [ "$(curl -sIL -o /dev/null -w '%{http_code}' "$u")" = 200 ]; then printf '%s' "$u"; return 0; fi
+  curl -sL "https://api.github.com/repos/$REPO/releases?per_page=100" |
+    sed -n 's/.*"browser_download_url": *"\([^"]*\)".*/\1/p' | grep -F "$RUNTIME_ASSET" | head -1
+}
+
 say "колонка $HOST:$PORT — проверяю вход"
 $SSH 'uname -m; df -m /data | tail -1' || { echo "нет SSH к колонке — сначала рут (runbook)"; exit 1; }
 
-TAG=$(curl -sL "https://api.github.com/repos/$REPO/releases/latest" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
-[ -n "$TAG" ] || { echo "не нашёл релиз $REPO"; exit 1; }
-say "релиз $TAG"
+# Тег — источник истины: по нему берётся код, по нему ищется ассет рунтайма.
+if [ -z "${TAG:-}" ]; then
+  TAG=$(curl -sL "https://api.github.com/repos/$REPO/tags?per_page=1" |
+        sed -n 's/.*"name": *"\([^"]*\)".*/\1/p' | head -1)
+fi
+[ -n "${TAG:-}" ] || { echo "не нашёл тег в $REPO"; exit 1; }
+say "тег $TAG"
 
 FREE=$($SSH "df -m /data | awk 'NR==2 {print \$4}'")
 HAVE=$($SSH "[ -x /data/opt/python/bin/python3.12 ] && [ -d $RBX/core ] && echo yes || echo no")
 if [ "$HAVE" = no ] || [ "${FORCE_RUNTIME:-0}" = 1 ]; then
-  [ "$HAVE" = yes ] || [ "$FREE" -ge 90 ] || { echo "на /data свободно $FREE МБ, нужно 90"; exit 1; }
-  say "ставлю Питон, библиотеки и ядро (~18 МБ скачать, ~78 МБ на колонке)"
-  run "curl -sL https://github.com/$REPO/releases/download/$TAG/station-runtime-armv7.tar.gz | $SSH 'mkdir -p /data/opt && cd /data/opt && gunzip -c | tar xf -'"
+  # 55 МБ: питон 29,6 + библиотеки 6,1 + ядро 8,7 ≈ 44 МБ (docs/inventory_2026-11-07.md) + запас
+  NEED_MB="${NEED_MB:-55}"
+  [ "$HAVE" = yes ] || [ "$FREE" -ge "$NEED_MB" ] || {
+    echo "на /data свободно $FREE МБ, нужно $NEED_MB (NEED_MB=NN — переопределить)"; exit 1; }
+  RURL=$(runtime_url || true)
+  [ -n "$RURL" ] || {
+    echo "не нашёл $RUNTIME_ASSET: ни в релизе $TAG, ни в других релизах $REPO"
+    echo "  либо приложи ассет к тегу:  gh release create $TAG $RUNTIME_ASSET --title $TAG"
+    echo "  либо укажи свой адрес:      RUNTIME_URL=https://… sh -s -- $HOST"
+    exit 1
+  }
+  say "ставлю Питон, библиотеки и ядро ($RURL)"
+  run "curl -fsSL '$RURL' | $SSH 'mkdir -p /data/opt && cd /data/opt && gunzip -c | tar xf -'"
 else
   say "Питон и ядро уже стоят — пропускаю (FORCE_RUNTIME=1 — переставить)"
 fi
