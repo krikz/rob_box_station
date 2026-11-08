@@ -107,3 +107,30 @@ def test_drain_idles_ring_without_speech():
     asyncio.run(live.drain())
 
     assert live._ring.states == ["idle"]
+
+
+class _Result:
+    def __init__(self, addressed: bool, said: list) -> None:
+        self.addressed, self.said = addressed, said
+
+
+def test_wordless_turn_keeps_ring_listening():
+    """Голое «Игорёк» (ход без слов): кольцо показывает «слушаю», а не гаснет молча."""
+    ring = _Ring()
+
+    async def run() -> bool:
+        return sh.wordless_tail(ring, _Result(addressed=True, said=[]))
+
+    assert asyncio.run(run()) is True
+    assert ring.states == ["listen"]
+
+
+def test_turn_with_speech_does_not_touch_ring():
+    """Обычный ответ кольцом управляет озвучка, а не этот хелпер."""
+    ring = _Ring()
+
+    async def run() -> bool:
+        return sh.wordless_tail(ring, _Result(addressed=True, said=["У меня всё отлично."]))
+
+    assert asyncio.run(run()) is False
+    assert ring.states == []
