@@ -153,15 +153,19 @@ def reverb(x: torch.Tensor, share: float = 0.3, sr: int = 16000) -> torch.Tensor
     return x
 
 
-def split(synth: dict, real: dict, val_speaker: str):
-    """Пулы train/val: голос ``val_speaker`` — только в проверке; живые записи — в обоих (их мало)."""
+def split(synth: dict, real: dict, val_speaker: str, real_repeat: int = 1):
+    """Пулы train/val: голос ``val_speaker`` — только в проверке; живые записи — в обоих (их мало).
+
+    ``real_repeat`` (>1) повторяет живые клипы в пуле: синтетики 4500 против десятков живых, и без повтора
+    голос с микрофона колонки теряется в шуме озвучки — модель почти не видит реальную комнату.
+    """
     pools = {"train": {}, "val": {}}
     for cls, items in synth.items():
         pools["train"][cls] = [it for it in items if it[0] != val_speaker]
         pools["val"][cls] = [it for it in items if it[0] == val_speaker]
     for cls, items in real.items():
         for pool in pools.values():
-            pool.setdefault(cls, []).extend(items)
+            pool.setdefault(cls, []).extend(items * max(1, int(real_repeat)))
     return pools
 
 
@@ -196,7 +200,8 @@ def main() -> None:
     noise = [load_wav(p, sr) for p in sorted((HERE / "data" / "noise").glob("*.wav"))]
     print(f"классы {labels}; озвучка {sum(map(len, synth.values()))}, живые {sum(map(len, real.values()))} "
           f"(с вариантами скорости), фон {len(noise)} файлов", flush=True)
-    pools = split(synth, real, t["val_speaker"])
+    pools = split(synth, real, t["val_speaker"], t.get("real_repeat", 1))
+    print(f"живые в пуле × {t.get('real_repeat', 1)}", flush=True)
     mixer = Mixer(cfg, pools, noise, labels, random.Random(0))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     width = int(cfg.get("model", {}).get("width", 32))
