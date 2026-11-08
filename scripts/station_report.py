@@ -1,12 +1,13 @@
 """Жалоба в GitHub с колонки: «Игорёк, пожалуйся, что…» → issue с логом (Шифу 08.11).
 
-Решает код, а не модель (ADR-0148): фразу разбирает :func:`report_command`, тело issue собирает :class:`Reporter`.
-В issue уходят только факты — дословная жалоба, версия колонки, настройки и значимые строки её лога. Значения ключей
-маскируются (:func:`mask_secrets`), содержимое ``.env`` в тело не попадает.
+Решает код, а не модель (ADR-0148): фразу разбирает :func:`report_command`, факты собирает :class:`Reporter`.
+Оформление (заголовок и текст) делает модель: получает ФАКТЫ и :data:`ISSUE_PROMPT`, возвращает строгий JSON,
+код проверяет его (:func:`_draft_problem`) — выдуманные числа, потерянная жалоба и битый JSON отбрасываются.
+Не прошло — уходит шаблон кодом, жалоба не теряется. Значения ключей маскируются (:func:`mask_secrets`),
+содержимое ``.env`` в тело не попадает.
 
 Токен отдельный от обновлений: ``GH_ISSUE_TOKEN`` с правом ``Issues: Read and write`` только на ``REPO``.
-``GITHUB_TOKEN`` (обновления, [station_update](station_update.py)) остаётся read-only — токен на запись в домашней
-колонке это риск, расширять его нельзя.
+``GITHUB_TOKEN`` (обновления, [station_update](station_update.py)) колонке не нужен вовсе.
 """
 import hashlib
 import json
@@ -31,6 +32,27 @@ LOG_PATHS = [LOG.with_name(LOG.name + ".1"), LOG]
 
 #: Строки лога, по которым видно, что случилось; остальное (анимации кольца, Improv) в issue не нужно.
 MARKERS = ("🎤", "ход ", "STT", "429", "Traceback", "Error", "Exception", "ошибк", "🔑", "🔊", "⬆", "🔘", "ядро:")
+
+#: Правила оформления issue — единственное место, где живёт это знание (ADR-0148: факты и решение в коде,
+#: формулировки — за моделью). Модель получает ФАКТЫ и возвращает строгий JSON, код его проверяет.
+ISSUE_PROMPT = """Ты оформляешь issue в GitHub по жалобе, которую человек сказал голосовой колонке.
+Тебе дают ФАКТЫ: дословную жалобу, версию, настройки и строки лога.
+
+Правила:
+1. Ничего не выдумывай. Любое число, версия, имя и цитата — только из ФАКТОВ.
+2. Жалобу приводи дословно, блоком цитаты (> ...), без правок и без смягчения формулировок.
+3. Заголовок (title): начинается с «колонка: », не длиннее 70 символов, обрезка по границе слова,
+   без кавычек, эмодзи и точки в конце.
+4. Тело (body) — markdown из трёх разделов:
+   ## Что случилось
+   ## Что видно в логе
+   ## Устройство
+   В «Что видно в логе» — от 3 до 8 самых показательных строк из ФАКТОВ, в блоке ```.
+   В «Устройство» — версия и настройки из ФАКТОВ.
+5. Причину поломки не угадывай и починку не предлагай: только что произошло и что видно.
+6. Ключей, токенов и паролей в тексте быть не должно (в ФАКТАХ их уже нет).
+7. Ответ — строго JSON и больше ничего: {"title": "...", "body": "..."} — без ``` и без пояснений.
+"""
 
 _SECRET_PATTERNS = (
     re.compile(r"(?i)\b([A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASS|PASSWORD|SALT)[A-Z0-9_]*)\s*[=:]\s*\S+"),
@@ -92,14 +114,78 @@ def _post(url: str, token: str, payload: dict, timeout: float = 20) -> Tuple[int
         return exc.code, {}
 
 
+def _parse_draft(answer: str) -> Tuple[str, str]:
+    """Достать ``title``/``body`` из ответа модели: ``` и болтовня вокруг — не повод падать."""
+    text = (answer or "").strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else text
+        text = text.rstrip("`").rstrip()
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("в ответе нет JSON")
+    data = json.loads(text[start:end + 1])
+    if not isinstance(data, dict):
+        raise ValueError("ответ модели — не объект")
+    return str(data.get("title") or "").strip(), str(data.get("body") or "").strip()
+
+
+def _draft_problem(title: str, body: str, complaint: str, facts: str) -> str:
+    """Чем ответ модели не годен (пусто — годен): то, что нельзя проверять глазами каждый раз."""
+    if not 8 <= len(title) <= 90 or "\n" in title:
+        return f"заголовок не по правилам ({len(title)} символов)"
+    if not 120 <= len(body) <= 6000:
+        return f"тело не по правилам ({len(body)} символов)"
+    if " ".join(complaint.split()) not in " ".join(body.split()):
+        return "жалобы нет в теле дословно"
+    invented = sorted(set(re.findall(r"\d+", title + " " + body)) - set(re.findall(r"\d+", facts)))
+    if invented:
+        return "числа не из фактов: " + ", ".join(invented[:5])
+    return ""
+
+
+def deepseek_formatter(log: Callable[[str], None]) -> Optional[Callable[[str], str]]:
+    """Оформление issue моделью: синхронный вызов DeepSeek ключом колонки (``DEEPSEEK_API_KEY``).
+
+    ``None`` — ключа нет (или пакет ``rob_box_llm`` не в сборке): тогда Reporter оформит шаблоном кодом.
+    """
+    key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if not key:
+        return None
+
+    def call(facts: str) -> str:
+        import asyncio  # noqa: PLC0415
+
+        from rob_box_llm.provider import LLMMessage, LLMSettings  # noqa: PLC0415
+        from rob_box_llm.providers.deepseek import DeepSeekProvider  # noqa: PLC0415
+
+        async def run() -> str:
+            provider = DeepSeekProvider(api_key=key, timeout=25.0)
+            try:
+                response = await provider.complete(
+                    [LLMMessage(role="system", content=ISSUE_PROMPT), LLMMessage(role="user", content=facts)],
+                    settings=LLMSettings(temperature=0.2, max_tokens=900),
+                )
+            finally:
+                await provider.aclose()
+            return response.content
+
+        log("📮 оформляю issue моделью")
+        return asyncio.run(run())
+
+    return call
+
+
 class Reporter:
     """Завести issue по жалобе; фразу колонке строит код (не модель)."""
 
     def __init__(self, base: Path, token: Callable[[], str], log: Callable[[str], None],
-                 state_path: Optional[Path] = None, log_paths: Optional[Sequence[Path]] = None) -> None:
+                 state_path: Optional[Path] = None, log_paths: Optional[Sequence[Path]] = None,
+                 format_with: Optional[Callable[[str], str]] = None) -> None:
         self.base, self.token, self.log = base, token, log
         self.state_path = state_path or base / "report_state.json"
         self.log_paths: List[Path] = list(log_paths or LOG_PATHS)
+        #: Оформление моделью: получает ФАКТЫ, возвращает ответ (JSON). ``None`` — сразу шаблон кодом.
+        self.format_with = format_with
 
     def version(self) -> str:
         try:
@@ -140,9 +226,36 @@ class Reporter:
                       self.excerpt() or "лог пуст", "```"]
         return "\n".join(parts) + "\n"
 
+    def facts(self, complaint: str, with_log: bool) -> str:
+        """ФАКТЫ для модели: ровно то, что видно колонке, без ключей и без домыслов."""
+        settings = ", ".join(f"{name}: {value}" for name, value in self.context().items())
+        parts = ["ЖАЛОБА (дословно):", complaint, "", f"ВЕРСИЯ КОЛОНКИ: {self.version()}",
+                 f"НАСТРОЙКИ: {settings}"]
+        if with_log:
+            parts += ["", "ЗНАЧИМЫЕ СТРОКИ ЛОГА (хвост; время — по часам хоста):", self.excerpt() or "лог пуст"]
+        return "\n".join(parts)
+
+    def draft(self, complaint: str, with_log: bool) -> Tuple[str, str]:
+        """(title, body): от модели, если её ответ прошёл проверку кодом; иначе шаблон — жалоба не теряется."""
+        facts = self.facts(complaint, with_log)
+        if self.format_with is not None:
+            try:
+                title, body = _parse_draft(self.format_with(facts))
+                title, body = mask_secrets(title), mask_secrets(body)
+                problem = _draft_problem(title, body, complaint, facts)
+                if not problem:
+                    return title, body
+                self.log(f"📮 оформление моделью не прошло: {problem} — беру шаблон кодом")
+            except Exception as exc:  # noqa: BLE001 — ответ модели не должен ломать жалобу
+                self.log(f"📮 оформление моделью не вышло: {type(exc).__name__} — беру шаблон кодом")
+        return self.title(complaint), self.body(complaint, with_log)
+
     @staticmethod
     def title(complaint: str) -> str:
-        head = " ".join(complaint.split())[:70]
+        head = " ".join(complaint.split())
+        if len(head) > 70:
+            cut = head[:70].rsplit(" ", 1)[0].rstrip(" ,.;:—-")
+            head = cut or head[:70]
         return f"колонка: {head}" if head else "колонка: жалоба без слов"
 
     @staticmethod
@@ -180,9 +293,10 @@ class Reporter:
             if state.get("hash") == self.digest(complaint):
                 return f"Эту жалобу уже отправил, номер {state.get('number', '?')}."
             return f"Только что отправлял жалобу, подожди {int(wait // 60) + 1} мин."
+        title, body = self.draft(complaint, with_log)
         try:
             status, answer = _post(f"https://api.github.com/repos/{REPO}/issues", token,
-                                   {"title": self.title(complaint), "body": self.body(complaint, with_log)})
+                                   {"title": title, "body": body})
         except Exception as exc:  # noqa: BLE001 — сеть не роняет хост (07.11: тайм-аут уже ронял)
             self.log(f"📮 жалоба не ушла: {type(exc).__name__}: {exc}")
             return "Жалоба не ушла: гитхаб не ответил."
