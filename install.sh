@@ -16,6 +16,9 @@ RBX=/data/opt/rbx
 say() { printf '\033[36m▶ %s\033[0m\n' "$*"; }
 run() { if [ "${DRY_RUN:-0}" = 1 ]; then printf '  [dry] %s\n' "$*"; else sh -c "$*"; fi; }
 SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -p $PORT root@$HOST"
+# Скрипт запускают как `curl … | sh`, то есть sh читает САМ СЕБЯ из stdin.
+# Поэтому любой ssh без -n съест остаток скрипта — для одиночных вызовов только SSHN.
+SSHN="ssh -n -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -p $PORT root@$HOST"
 
 RUNTIME_ASSET=station-runtime-armv7.tar.gz
 
@@ -29,7 +32,7 @@ runtime_url() {
 }
 
 say "колонка $HOST:$PORT — проверяю вход"
-$SSH 'uname -m; df -m /data | tail -1' || { echo "нет SSH к колонке — сначала рут (runbook)"; exit 1; }
+$SSHN 'uname -m; df -m /data | tail -1' || { echo "нет SSH к колонке — сначала рут (runbook)"; exit 1; }
 
 # Тег — источник истины: по нему берётся код, по нему ищется ассет рунтайма.
 if [ -z "${TAG:-}" ]; then
@@ -39,8 +42,8 @@ fi
 [ -n "${TAG:-}" ] || { echo "не нашёл тег в $REPO"; exit 1; }
 say "тег $TAG"
 
-FREE=$($SSH "df -m /data | awk 'NR==2 {print \$4}'")
-HAVE=$($SSH "[ -x /data/opt/python/bin/python3.12 ] && [ -d $RBX/core ] && echo yes || echo no")
+FREE=$($SSHN "df -m /data | awk 'NR==2 {print \$4}'")
+HAVE=$($SSHN "[ -x /data/opt/python/bin/python3.12 ] && [ -d $RBX/core ] && echo yes || echo no")
 if [ "$HAVE" = no ] || [ "${FORCE_RUNTIME:-0}" = 1 ]; then
   # 55 МБ: питон 29,6 + библиотеки 6,1 + ядро 8,7 ≈ 44 МБ (docs/inventory_2026-11-07.md) + запас
   NEED_MB="${NEED_MB:-55}"
@@ -65,11 +68,11 @@ say "код колонки $TAG"
 curl -sL "https://codeload.github.com/$REPO/tar.gz/refs/tags/$TAG" | (cd "$TMP" && tar xzf - --strip-components=1)
 run "cd '$TMP/scripts' && tar cf - *.py motd.sh | $SSH 'mkdir -p $RBX && cd $RBX && tar xf - && echo $TAG > VERSION'"
 run "cd '$TMP' && tar cf - assets prompts | $SSH 'cd /tmp && rm -rf rbxnew && mkdir rbxnew && cd rbxnew && tar xf - && cp -a assets $RBX/ && mkdir -p $RBX/prompts && for f in prompts/*; do [ -f $RBX/\$f ] || cp \$f $RBX/\$f; done; cd /tmp && rm -rf rbxnew'"
-run "$SSH 'E=$RBX/core/scripts/dialogue/.env; [ -f \$E ] || { printf \"DEEPSEEK_API_KEY=\\nMINIMAX_API_KEY=\\nMINIMAX_GROUP_ID=\\n\" > \$E; chmod 600 \$E; }'"
+run "$SSHN 'E=$RBX/core/scripts/dialogue/.env; [ -f \$E ] || { printf \"DEEPSEEK_API_KEY=\\nMINIMAX_API_KEY=\\nMINIMAX_GROUP_ID=\\n\" > \$E; chmod 600 \$E; }'"
 
 say "автозапуск, глушение Алисы, приветствие SSH (системная часть: remount rw → ro)"
 run "cd '$TMP/scripts' && tar cf - S99zzyandexoff S99zzzrbxhost | $SSH 'mount -o remount,rw / && cd /etc/init.d && tar xf - && chmod +x S99zzyandexoff S99zzzrbxhost && printf \"[ -f $RBX/motd.sh ] && . $RBX/motd.sh\\n\" > /etc/profile.d/rbx.sh && sync; mount -o remount,ro /'"
-run "$SSH 'touch /data/opt/yandex_off /data/opt/rbx_host && /etc/init.d/S99zzyandexoff start && DELAY=0 /etc/init.d/S99zzzrbxhost restart'"
+run "$SSHN 'touch /data/opt/yandex_off /data/opt/rbx_host && /etc/init.d/S99zzyandexoff start && DELAY=0 /etc/init.d/S99zzzrbxhost restart'"
 
 say "готово. Открой http://$HOST:8080 — впиши ключи (DeepSeek, MiniMax), нажми любую кнопку колонки, «Сохранить»."
 say "Wi-Fi потом можно сменить там же или с телефона по Bluetooth (Chrome → improv-wifi.com). Обновления: «Игорёк, обновись»."
