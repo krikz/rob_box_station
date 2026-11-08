@@ -39,7 +39,7 @@ WIFI_WAIT_S = 30.0
 HTTP_PORT = int(os.environ.get("RBX_HTTP_PORT", "8080"))
 #: Ключи, которые правятся со страницы (имена из ``scripts/dialogue/.env`` колонки).
 #: GITHUB_TOKEN — обновления закрытого репо (только чтение); GH_ISSUE_TOKEN — жалоба в GitHub («пожалуйся»):
-#: отдельный fine-grained, право Issues: Read and write только на krikz/rob_box_project.
+#: отдельный fine-grained, право Issues: Read and write только на krikz/rob_box_station.
 #: YANDEX_API_KEY — распознавание и синтез Яндекса; JEV_API_KEY — чойсер.
 KEY_NAMES = ("DEEPSEEK_API_KEY", "MINIMAX_API_KEY", "MINIMAX_GROUP_ID", "YANDEX_API_KEY", "JEV_API_KEY", "GITHUB_TOKEN",
              "GH_ISSUE_TOKEN")

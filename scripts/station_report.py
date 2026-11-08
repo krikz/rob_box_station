@@ -18,7 +18,7 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 
-REPO = os.environ.get("RBX_REPORT_REPO", "krikz/rob_box_project")
+REPO = os.environ.get("RBX_REPORT_REPO", "krikz/rob_box_station")
 #: Пауза между жалобами: защита от «пожалуйся, пожалуйся, пожалуйся» и от спама в репозиторий.
 COOLDOWN_S = float(os.environ.get("RBX_REPORT_COOLDOWN_S", "600"))
 #: Сколько значимых строк лога кладём в issue и сколько символов всего (issue не должен быть свалкой).

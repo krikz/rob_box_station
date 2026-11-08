@@ -37,13 +37,13 @@ curl -sL https://raw.githubusercontent.com/krikz/rob_box_station/main/install.sh
 
 ## Жалоба в GitHub («Игорёк, пожалуйся»)
 
-Голосом: «Игорёк, пожалуйся, что не слышишь меня» — колонка заводит issue в `krikz/rob_box_project`
+Голосом: «Игорёк, пожалуйся, что не слышишь меня» — колонка заводит issue в `krikz/rob_box_station`
 (`RBX_REPORT_REPO` меняет репозиторий). Фразу разбирает код (`station_report.report_command`), тело issue собирает
 `station_report.Reporter`: дословная жалоба, `VERSION`, настройки без ключей и значимые строки `/tmp/station.log`
 (и `.1`). «Пожалуйся без лога» — без строк лога; значения ключей маскируются (`mask_secrets`).
 
 Нужен отдельный токен `GH_ISSUE_TOKEN` на странице `:8080` — fine-grained, право **Issues: Read and write** только
-на `krikz/rob_box_project`. Токен обновлений `GITHUB_TOKEN` для этого не годится и расширять его нельзя: обновлениям
+на `krikz/rob_box_station`. Токен обновлений `GITHUB_TOKEN` для этого не годится и расширять его нельзя: обновлениям
 хватает чтения. Пауза между жалобами — 10 минут (`RBX_REPORT_COOLDOWN_S`); та же жалоба в это окно второй раз не уходит.
 
 ## Хендофф 07.11 вечер (начинать отсюда)

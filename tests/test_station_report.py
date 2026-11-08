@@ -16,7 +16,7 @@ def posted(monkeypatch):
 
     def fake_post(url, token, payload, _timeout=20):
         calls.append({"url": url, "token": token, "payload": payload})
-        return 201, {"number": len(calls), "html_url": f"https://github.com/krikz/rob_box_project/issues/{len(calls)}"}
+        return 201, {"number": len(calls), "html_url": f"https://github.com/krikz/rob_box_station/issues/{len(calls)}"}
 
     monkeypatch.setattr(sr, "_post", fake_post)
     return calls
@@ -90,7 +90,7 @@ def test_file_posts_issue_and_speaks_number(tmp_path, posted):
     phrase = _reporter(tmp_path, logs=logs).file("не слышишь меня")
 
     assert "номер 1" in phrase and "https" not in phrase
-    assert posted[0]["url"] == "https://api.github.com/repos/krikz/rob_box_project/issues"
+    assert posted[0]["url"] == "https://api.github.com/repos/krikz/rob_box_station/issues"
     assert posted[0]["token"] == "gh-token"
     assert posted[0]["payload"]["title"] == "колонка: не слышишь меня"
     assert "> не слышишь меня" in posted[0]["payload"]["body"]
@@ -114,11 +114,11 @@ def test_cooldown_blocks_other_complaint(tmp_path, posted):
     assert "подожди" in reporter.file("музыка обрывается") and len(posted) == 1
 
 
-def test_report_repo_is_projekt_by_default(tmp_path, posted):
-    """По умолчанию жалоба уходит в rob_box_project — колонка сама репозиторий не выбирает."""
-    assert sr.REPO == "krikz/rob_box_project"
+def test_report_repo_is_station_by_default(tmp_path, posted):
+    """По умолчанию жалоба уходит в rob_box_station (Шифу 08.11) — колонка сама репозиторий не выбирает."""
+    assert sr.REPO == "krikz/rob_box_station"
     _reporter(tmp_path).file("долго думаешь")
-    assert "/repos/krikz/rob_box_project/issues" in posted[0]["url"]
+    assert "/repos/krikz/rob_box_station/issues" in posted[0]["url"]
 
 
 def test_no_token_speaks_about_settings_page(tmp_path, posted):
