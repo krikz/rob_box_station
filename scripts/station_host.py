@@ -1098,6 +1098,36 @@ def wifi_done(ok: bool, ring: "Ring", mic: Mic) -> None:
         asyncio.get_running_loop().call_later(4.0, restart_self, mic, "сеть Wi-Fi")
 
 
+async def serve_setup_only() -> None:
+    """Ключей STT нет — держим только страницу настроек: ключи вписывают там, дальше процесс перезапускается."""
+    import station_setup as setup  # noqa: PLC0415
+
+    loop = asyncio.get_running_loop()
+    auth = setup.Auth()
+    Keys(loop, lambda code: auth.grant())  # любая кнопка колонки открывает окно настройки
+    for name, value in (("RBX_WAKE", ",".join(WAKE_WORDS)), ("RBX_VOLUME", VOLUME), ("RBX_LED", str(LED_BRIGHT))):
+        os.environ.setdefault(name, value)  # форма показывает то, что сейчас в силе
+
+    def restart_self_soft() -> None:
+        os.execv(sys.executable, [sys.executable, "-X", "utf8", "-u", SELF] + sys.argv[1:])
+
+    def on_saved(new: dict, keys: list) -> None:
+        os.environ.update(new)
+        volume = int(new.get("RBX_VOLUME", VOLUME))
+        subprocess.run(["amixer", "-q", "sset", "Master", str(volume)], check=False)
+        if keys:  # ключи читает только новый процесс
+            log("⚙ ключи сохранены — перезапуск")
+            loop.call_later(1.0, restart_self_soft)
+
+    try:
+        await setup.SettingsServer(SETTINGS, CORE / "scripts" / "dialogue" / ".env", auth, on_saved, log,
+                                   prompts=station_prompts(setup)).start()
+    except OSError as exc:
+        log(f"⚙ страница настроек не поднялась: {exc}")
+        return
+    await asyncio.Event().wait()
+
+
 def station_prompts(setup):
     """Промпт колонки: свои копии в ``BASE/prompts``, основа ядра — в его ``rob_box_voice/prompts``."""
     return setup.Prompts(CORE / "src" / "rob_box_voice" / "prompts", BASE / "prompts")
@@ -1127,7 +1157,12 @@ def main() -> int:
     os.chdir(CORE)
     load_env()
     subprocess.run(["amixer", "-q", "sset", "Master", VOLUME], check=False)
-    voice = Voice()
+    try:
+        voice = Voice()
+    except SystemExit as exc:  # ключа STT нет: диалога не будет, но страницу для ввода ключа отдаём
+        log(f"⚙ {exc} — поднимаю только страницу настроек")
+        asyncio.run(serve_setup_only())
+        return 0
     if args.say:
         log(f"синтез {asyncio.run(voice.say(args.say)):.2f} с")
     elif args.turn:
