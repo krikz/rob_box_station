@@ -74,6 +74,7 @@ class KwsCollector:
         self.min_free = _mb("RBX_KWS_FREE_MB", 8)
         self.recent: deque = deque(maxlen=12)  # (время, pcm, текст, метка, p, провайдер) фраз без вейка, ждут окно промаха
         self._used: dict = {}
+        self._seq = 0
         self._full_logged: set = set()
 
     # ------------------------------------------------------------------ место
@@ -111,7 +112,8 @@ class KwsCollector:
             return ""
         try:
             (self.folder / kind).mkdir(parents=True, exist_ok=True)
-            name = f"real__{int(time.time() * 1000)}.wav"
+            self._seq += 1  # несколько промахов пишутся в одну миллисекунду — имя не должно совпасть
+            name = f"real__{int(time.time() * 1000)}_{self._seq}.wav"
             (self.folder / kind / name).write_bytes(data)
             self._used[kind] = self.used(kind) + len(data)
             with open(self.folder / "index.jsonl", "a", encoding="utf-8") as idx:

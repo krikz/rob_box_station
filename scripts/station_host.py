@@ -108,6 +108,8 @@ class Mic:
         self.state = None
         self.muted = False
         self.user_muted = False  # кнопка «микрофон выкл»: кадры не идут в VAD, пока не включат
+        #: Звонок по телефону: кадры уходят собеседнику, а не в VAD (вейк в разговоре не слушаем).
+        self.tap = None
         self.q: "queue.Queue[bytes]" = queue.Queue(maxsize=int(30 / FRAME_S))  # 30 с запаса
         threading.Thread(target=self._pump, daemon=True).start()
 
@@ -123,6 +125,10 @@ class Mic:
     def _pump(self) -> None:
         while True:
             fr = self._read()
+            tap = self.tap
+            if tap is not None:
+                tap(fr)
+                continue
             if self.muted or self.user_muted:
                 continue
             try:
@@ -561,7 +567,39 @@ def device_facts() -> str:
             "phone).\n"
             "- Complaints and bug reports for your developers: you CAN file them yourself with the `report_issue` tool "
             "(a GitHub issue with your log). Use it when the person asks to complain, report a bug or pass something "
-            "to the developers — never say you cannot. Never use it on your own initiative.")
+            "to the developers — never say you cannot. Never use it on your own initiative.\n"
+            "- Phone calls go through the person's phone by Bluetooth, and your code places them: «Игорёк, набери "
+            "Кира» / «позвони маме», «прими», «сбрось» (or the Alice button). Tell people these words when asked.\n"
+            + JOKE_RULES)
+
+
+#: Анекдоты (Шифу 09.11: «Игорёк рассказывает не смешные анекдоты»). Живут в коде, а не в промпте колонки: промпт
+#: Шифу правит на странице, а это правило должно доехать обновлением. Характер зануды из дополнения тянул
+#: «уточню формулировку» сразу после концовки — шутка умирала.
+JOKE_RULES = (
+    "- JOKES («расскажи анекдот», «пошути»): tell ONE real, well-known Russian anekdot that people actually laugh at "
+    "(Штирлиц, Вовочка, Петька и Василий Иванович, Рабинович, программисты, работа, семья, врачи) — not a pun you "
+    "invent on the spot and not a children's riddle. Keep it short: setup in 1–3 sentences, dialogue with dashes, "
+    "«…» right before the punchline, and the punchline is the LAST words you say. Never explain the joke, never "
+    "add a moral, a clarification or your character's remark after the punchline (one short line before the joke "
+    "is fine). «Ещё» — a different joke on a different theme; never repeat one told in this conversation. A topic "
+    "named — a joke on that topic. No jokes about nationality, disability or illness of real people; adult jokes "
+    "only when asked. Never change the punchline of a known joke and never make up a new «Штирлиц…» ending: if you "
+    "do not remember a joke word for word, tell one you do. The level to aim for (folk classics — tell these or "
+    "others just as famous; 09.11 «tell other ones» made the model invent unfunny endings, so these are allowed):\n"
+    "  «Штирлиц выстрелил в упор. Упор упал.»\n"
+    "  «Штирлиц долго смотрел в одну точку. Потом в другую. «Двоеточие!» — догадался Штирлиц.»\n"
+    "  «— Вовочка, назови два местоимения. — Кто, я? — Правильно.»\n"
+    "  «— Петька, приборы! — Двести! — Что «двести»? — А что «приборы»?»\n"
+    "  «Программист ставит на ночь у кровати два стакана: с водой — если захочет пить, и пустой — если не "
+    "захочет.»\n"
+    "  «— Доктор, меня все игнорируют. — Следующий!»\n"
+    "  «— Доктор, у меня всё болит: куда ни нажму — везде больно. — У вас, батенька, палец сломан.»\n"
+    "  «Кошка сидит у норки и лает. Мышь думает: собака, значит, кошки нет, — и вылезла. Кошка её хвать: "
+    "«Вот что значит знать иностранные языки!»»\n"
+    "  «— Алло, это прачечная? — Хреначечная! Это Министерство культуры!»\n"
+    "  «— Василий Иванович, а ты армией командовать можешь? — Могу, Петька. — А фронтом? — Могу. — А всем "
+    "миром? — Нет, Петька, языков не знаю.»")
 
 
 class _LogNode:
@@ -804,8 +842,9 @@ async def first_heard(chain_task: asyncio.Future, sprint_task: asyncio.Future):
     return last
 
 
-async def code_command(text: str, live: "LiveOut", updater, reporter, bt, mic: Mic) -> bool:
-    """Команды, которые решает код (ADR-0148), — после вейка: обновление, жалоба, Bluetooth. Выполнил — ``True``."""
+async def code_command(text: str, live: "LiveOut", updater, reporter, bt, mic: Mic, hfp=None) -> bool:
+    """Команды, которые решает код (ADR-0148), — после вейка: обновление, жалоба, звонок, Bluetooth.
+    Выполнил — ``True``."""
     import station_report  # noqa: PLC0415
     import station_update  # noqa: PLC0415
 
@@ -836,6 +875,14 @@ async def code_command(text: str, live: "LiveOut", updater, reporter, bt, mic: M
         live.speak(await asyncio.to_thread(reporter.file, complaint, action == "file"))
         await live.drain()
         return True
+    if hfp is not None:
+        reply = await hfp.handle(rest)
+        if reply is not None:  # звонок: «набери Кира», «прими», «сбрось» — AT-команды телефону
+            live.earcon()
+            if reply:
+                live.speak(reply)
+            await live.drain()
+            return True
     reply = await bt.handle(rest)
     if reply:  # Bluetooth-музыка: ход модели не нужен
         live.earcon()
@@ -843,6 +890,33 @@ async def code_command(text: str, live: "LiveOut", updater, reporter, bt, mic: M
         await live.drain()
         return True
     return False
+
+
+async def start_hfp(live: "LiveOut", mic: Mic, ring: "Ring"):
+    """Звонки через телефон (``station_hfp``, #16): ``RBX_HFP=0`` — выключить (bluealsa остаётся как у Алисы)."""
+    if os.environ.get("RBX_HFP", "1").strip().lower() in ("0", "off", "false", "no"):
+        return None
+    import station_hfp  # noqa: PLC0415
+
+    def on_ring(who: str) -> None:
+        live.tone("ok")
+        live.speak(f"Звонит {who}. Скажи «Игорёк, прими» или нажми кнопку сверху.")
+
+    def on_call(up: bool) -> None:
+        if up:
+            live.stop()  # своя речь в разговор не лезет
+            mic.tap = hfp.audio.feed if hfp.audio else None
+            ring.set("connect")
+        else:
+            mic.tap = None
+            mic.flush()
+            ring.idle()
+            live.tone("ok")
+
+    hfp = station_hfp.Hfp(log, on_ring, on_call)
+    await asyncio.to_thread(station_hfp.Hfp.ensure_profile, log)
+    asyncio.ensure_future(hfp.keep_attached())
+    return hfp
 
 
 def announce_start(live: "LiveOut", version: str) -> None:
@@ -884,6 +958,8 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
     asyncio.get_running_loop().call_later(30, station_update.OK_MARK.touch)  # «здоров» — сторож отката не нужен
     version = updater.current()
     log(f"версия колонки: {version}")
+    hfp = await start_hfp(live, mic, ring)
+    buttons.hfp = hfp
     Keys(asyncio.get_running_loop(), buttons.on_key)
     await start_setup(stand, mic, ring, buttons)
     announce_start(live, version)
@@ -933,7 +1009,7 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
                 tries = kws.promote_misses(now=t1)
                 if tries:
                     log(f"🔑 вейк с {tries + 1}-й попытки: до этого {tries} фраз(ы) без имени — в kws_real/miss")
-            if await code_command(text, live, updater, reporter, bt, mic):
+            if await code_command(text, live, updater, reporter, bt, mic, hfp):
                 mic.flush()
                 continue
             log(f"🧠 окно до хода: записей {len(stand.engine.log.window())}, токенов {stand.engine.log.tokens()}")
@@ -1329,6 +1405,7 @@ class Buttons:
         self._mic, self._ring, self._live, self.auth = mic, ring, live, auth
         self.volume = int(VOLUME)
         self.armed_until = 0.0
+        self.hfp = None  # звонок: кнопка Алисы принимает/сбрасывает (station_hfp)
 
     def on_key(self, code: int) -> None:
         if self.auth is not None:
@@ -1360,6 +1437,11 @@ class Buttons:
         log(f"🔘 громкость {self.volume}")
 
     def _action(self) -> None:
+        hfp = self.hfp
+        if hfp is not None and (hfp.ringing or hfp.in_call):
+            asyncio.ensure_future(hfp.press())
+            log(f"🔘 звонок: {'сброс' if hfp.in_call else 'принять'}")
+            return
         if self._live.busy():
             self._live.stop()
             log("🔘 стоп: речь оборвана кнопкой")
