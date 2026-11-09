@@ -106,12 +106,23 @@ class Mic:
         self.proc = subprocess.Popen(["arecord", "-q", "-D", MIC_DEVICE, "-f", "S16_LE", "-r", str(RATE), "-c", "1",
                                       "-t", "raw"], stdout=subprocess.PIPE, bufsize=0)
         self.state = None
-        self.muted = False
+        self._muted, self.muted_since = False, 0.0
         self.user_muted = False  # кнопка «микрофон выкл»: кадры не идут в VAD, пока не включат
         #: Звонок по телефону: кадры уходят собеседнику, а не в VAD (вейк в разговоре не слушаем).
         self.tap = None
         self.q: "queue.Queue[bytes]" = queue.Queue(maxsize=int(30 / FRAME_S))  # 30 с запаса
         threading.Thread(target=self._pump, daemon=True).start()
+
+    @property
+    def muted(self) -> bool:
+        """Микрофон заглушён на время своей речи (полудуплекс); ``muted_since`` — с какого момента."""
+        return self._muted
+
+    @muted.setter
+    def muted(self, value: bool) -> None:
+        if value and not self._muted:
+            self.muted_since = time.time()
+        self._muted = bool(value)
 
     def _read(self) -> bytes:
         raw = b""
@@ -193,6 +204,40 @@ def play(pcm: bytes, rate: int = TTS_RATE) -> None:
     subprocess.run(aplay_cmd(rate), input=pcm, check=False)
 
 
+def stop_player(proc: "subprocess.Popen | None", why: str = "") -> None:
+    """Остановить ``aplay`` МЯГКО: SIGTERM — он сам закрывает устройство ALSA.
+
+    09.11 корень глухоты колонки: ``proc.kill()`` (SIGKILL) посреди фразы оставлял общий микшер ``dmix``
+    (``/etc/asound.conf``, ``ipc_key 1024``) в состоянии «запущено», и СЛЕДУЮЩИЙ ``aplay`` навсегда висел на
+    подготовленном, но не запущенном устройстве (``tdm prepare`` без ``playback enable`` в ``dmesg``); хост ждал
+    его, микрофон оставался заглушён «на время речи» — 35 мин глухоты. Повторено руками: SIGKILL → следующий
+    ``aplay`` висит; SIGTERM — 3 из 3 без зависания. SIGKILL — только если ``aplay`` не вышел за секунду.
+    """
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        log(f"⚠ aplay не вышел по SIGTERM за 1 с{' (' + why + ')' if why else ''} — SIGKILL, звук может сломаться")
+        proc.kill()
+
+
+#: Проигрывание дольше длины звука на столько секунд — зависло (сломанный микшер, драйвер): обрываем и слушаем.
+PLAY_SLACK_S = 5.0
+#: Потоковая фраза целиком — не дольше этого.
+STREAM_MAX_S = 90.0
+
+
+async def wait_player(proc: "subprocess.Popen", pcm: bytes | None, deadline: float, what: str) -> None:
+    """Отдать ``pcm`` в ``aplay`` и дождаться конца, но не дольше ``deadline`` секунд."""
+    try:
+        await asyncio.wait_for(asyncio.to_thread(proc.communicate, pcm), deadline)
+    except asyncio.TimeoutError:
+        log(f"⚠ {what}: звук не доиграл за {deadline:.0f} с — aplay завис, обрываю")
+        await asyncio.to_thread(stop_player, proc, what)
+
+
 class _NoAudioYet(Exception):
     """Поток TTS упал до первого куска звука — можно повторить целым синтезом, слушатель ничего не услышал."""
 
@@ -225,7 +270,7 @@ class Voice:
             if on_sound:
                 on_sound()
             self.proc = subprocess.Popen(aplay_cmd(), stdin=subprocess.PIPE)
-            await asyncio.to_thread(self.proc.communicate, pcm)
+            await wait_player(self.proc, pcm, len(pcm) / (2 * TTS_RATE) + PLAY_SLACK_S, "готовый звук")
         finally:
             if mic:
                 await asyncio.sleep(0.3)
@@ -235,8 +280,7 @@ class Voice:
     def stop(self) -> None:
         """Кнопка: оборвать текущую реплику (aplay убить, поток синтеза бросить)."""
         self.cut = True
-        if self.proc is not None and self.proc.poll() is None:
-            self.proc.kill()
+        stop_player(self.proc, "стоп")
 
     async def say(self, text: str, mic: Mic | None = None, on_sound=None, voice: str | None = None) -> float:
         """Синтез и проигрывание; возвращает время до первого звука от начала синтеза."""
@@ -265,7 +309,7 @@ class Voice:
         if on_sound:
             on_sound()  # звук пошёл: отсюда считается задержка, не от конца проигрывания
         self.proc = subprocess.Popen(aplay_cmd(), stdin=subprocess.PIPE)
-        await asyncio.to_thread(self.proc.communicate, pcm)
+        await wait_player(self.proc, pcm, len(pcm) / (2 * TTS_RATE) + PLAY_SLACK_S, "синтез целиком")
         return synth
 
     async def _say_stream(self, text: str, on_sound, voice: str | None = None) -> float:
@@ -305,10 +349,13 @@ class Voice:
                     proc, data, pending = start(rate), pending, b""
                 else:
                     data = chunk.samples
-                await asyncio.to_thread(proc.stdin.write, data)
+                await asyncio.wait_for(asyncio.to_thread(proc.stdin.write, data), PLAY_SLACK_S * 2)
+                if time.time() - t0 > STREAM_MAX_S:
+                    log(f"⚠ поток TTS дольше {STREAM_MAX_S:.0f} с — обрываю фразу")
+                    break
             if proc is None and pending and not self.cut:  # фраза короче запаса
                 proc = start(rate)
-                await asyncio.to_thread(proc.stdin.write, pending)
+                await asyncio.wait_for(asyncio.to_thread(proc.stdin.write, pending), PLAY_SLACK_S * 2)
         except Exception as exc:  # noqa: BLE001
             if proc is None:
                 raise _NoAudioYet() from exc
@@ -318,9 +365,13 @@ class Voice:
             if proc is not None:
                 try:
                     proc.stdin.close()
-                except BrokenPipeError:
-                    pass  # aplay убит кнопкой
-                await asyncio.to_thread(proc.wait)
+                except (BrokenPipeError, OSError):
+                    pass  # aplay остановлен кнопкой
+                try:  # в aplay осталось не больше ~запаса звука: доиграть — секунды, дольше — завис
+                    await asyncio.wait_for(asyncio.to_thread(proc.wait), PLAY_SLACK_S * 3)
+                except asyncio.TimeoutError:
+                    log("⚠ поток TTS: aplay не доиграл хвост — завис, обрываю")
+                    await asyncio.to_thread(stop_player, proc, "хвост потока")
         return first
 
     def stt_limited(self) -> bool:
@@ -966,6 +1017,22 @@ async def code_command(text: str, live: "LiveOut", updater, reporter, bt, mic: M
     return False
 
 
+#: Микрофон заглушён «на время речи» дольше этого — что-то зависло: колонка снова слушает.
+DEAF_MAX_S = float(os.environ.get("RBX_DEAF_MAX_S", "60"))
+
+
+async def deaf_watchdog(mic: Mic, live: "LiveOut", in_call=lambda: False, every: float = 5.0) -> None:
+    """Сторож глухоты: 09.11 колонка 35 мин не слышала ничего — висел ``aplay``, а микрофон ждал конца речи.
+    Длиннее ``DEAF_MAX_S`` своей речи не бывает (анекдот — 20 с): обрываем звук и снимаем заглушку."""
+    while True:
+        await asyncio.sleep(every)
+        if mic.muted and not in_call() and time.time() - mic.muted_since > DEAF_MAX_S:
+            log(f"⚠ микрофон заглушён {time.time() - mic.muted_since:.0f} с — что-то зависло, снова слушаю")
+            live.stop()
+            mic.flush()
+            mic.muted = False
+
+
 async def start_hfp(live: "LiveOut", mic: Mic, ring: "Ring"):
     """Звонки через телефон (``station_hfp``, #16): ``RBX_HFP=0`` — выключить (bluealsa остаётся как у Алисы)."""
     if os.environ.get("RBX_HFP", "1").strip().lower() in ("0", "off", "false", "no"):
@@ -1049,6 +1116,7 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
     install_phone_tool(stand, hfp, live)
     Keys(asyncio.get_running_loop(), buttons.on_key)
     await start_setup(stand, mic, ring, buttons)
+    asyncio.ensure_future(deaf_watchdog(mic, live, lambda: bool(hfp and hfp.in_call)))
     announce_start(live, version)
     live.refresh_offline(delay=8.0)  # пока сеть есть — досинтезировать фразы на случай, когда её не будет
     try:

@@ -337,3 +337,78 @@ def test_update_without_check_tells_news_first(monkeypatch):
     updater = _Updater()
     said = _update("обновись", updater, monkeypatch)
     assert "Что нового" in said[0] and updater.installed == ["v9.9.9"]
+
+
+class _Proc:
+    """Подмена aplay: ``hang`` — не выходит сам (как висящий на сломанном dmix)."""
+
+    def __init__(self, hang=False, ignore_term=False):
+        self.hang, self.ignore_term, self.signals, self.alive = hang, ignore_term, [], True
+
+    def poll(self):
+        return None if self.alive else 0
+
+    def terminate(self):
+        self.signals.append("TERM")
+        if not self.ignore_term:
+            self.alive = False
+
+    def kill(self):
+        self.signals.append("KILL")
+        self.alive = False
+
+    def wait(self, timeout=None):
+        if self.alive:
+            raise sh.subprocess.TimeoutExpired("aplay", timeout)
+        return 0
+
+    def communicate(self, data=None):
+        while self.hang and self.alive:
+            sh.time.sleep(0.01)
+        return b"", b""
+
+
+def test_stop_player_is_soft_first():
+    """09.11 корень глухоты: SIGKILL aplay ломал общий микшер dmix, следующий звук висел. Сначала SIGTERM."""
+    soft = _Proc()
+    sh.stop_player(soft)
+    assert soft.signals == ["TERM"]
+    stubborn = _Proc(ignore_term=True)
+    sh.stop_player(stubborn)
+    assert stubborn.signals == ["TERM", "KILL"]
+
+
+def test_wait_player_cuts_hung_playback():
+    proc = _Proc(hang=True)
+    asyncio.run(sh.wait_player(proc, b"\x00" * 100, 0.05, "тест"))
+    assert proc.signals == ["TERM"] and not proc.alive
+
+
+def test_deaf_watchdog_unmutes_after_limit(monkeypatch):
+    """Микрофон заглушён «на время речи» дольше DEAF_MAX_S — колонка снова слушает (35 мин глухоты 09.11)."""
+    monkeypatch.setattr(sh, "DEAF_MAX_S", 0.0)
+    mic = types.SimpleNamespace(muted=True, muted_since=0.0, flush=lambda: None)
+    stopped = []
+    live = types.SimpleNamespace(stop=lambda: stopped.append(True))
+
+    async def run():
+        task = asyncio.ensure_future(sh.deaf_watchdog(mic, live, every=0.01))
+        await asyncio.sleep(0.05)
+        task.cancel()
+
+    asyncio.run(run())
+    assert mic.muted is False and stopped
+
+
+def test_deaf_watchdog_leaves_phone_call_alone(monkeypatch):
+    monkeypatch.setattr(sh, "DEAF_MAX_S", 0.0)
+    mic = types.SimpleNamespace(muted=True, muted_since=0.0, flush=lambda: None)
+    live = types.SimpleNamespace(stop=lambda: None)
+
+    async def run():
+        task = asyncio.ensure_future(sh.deaf_watchdog(mic, live, in_call=lambda: True, every=0.01))
+        await asyncio.sleep(0.05)
+        task.cancel()
+
+    asyncio.run(run())
+    assert mic.muted is True
