@@ -272,6 +272,7 @@ class Hfp:
         self._task: Optional[asyncio.Task] = None
         self._asked: dict = {}  # устройство → когда просили Hands-Free
         self.released_until = 0.0  # отпустили Hands-Free на время звонка: до этого момента обратно не просим
+        self._released_at = 0.0
         self._device_path = ""  # /org/bluez/hci0/dev_… телефона на HFP
 
     # ------------------------------------------------------------------ bluealsa
@@ -402,10 +403,11 @@ class Hfp:
 
     async def release(self) -> None:
         """Отпустить Hands-Free у телефона: разговор остаётся в телефоне (см. :data:`RELEASE_HOLD_S`)."""
-        self.released_until = time.time() + RELEASE_HOLD_S
         path = self._device_path
-        if not path:
-            return
+        if not path or time.time() - self._released_at < 5:
+            return  # два «разговор начался» подряд (09.11: callsetup 2→0→3) — одна отпускалка
+        self._released_at = time.time()
+        self.released_until = time.time() + RELEASE_HOLD_S
         try:
             bus = await self._connect()
             intro = await bus.introspect("org.bluez", path)
