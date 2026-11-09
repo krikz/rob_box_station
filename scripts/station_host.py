@@ -418,6 +418,8 @@ STATION_STATE = {"volume": int(VOLUME), "mic_muted": False, "started": time.time
 KWS_DIR = Path(os.environ.get("RBX_KWS_DIR", str(BASE / "kws_real")))
 #: Офлайн-фразы (``station_offline``): не в ``assets/`` — их не трогает обновление.
 OFFLINE_DIR = BASE / "offline"
+#: Регистрация Improv в BlueZ дольше этого — без Improv: колонка не должна ждать Bluetooth, чтобы слушать.
+IMPROV_START_S = 10.0
 #: Ход дольше этого — сбой (модель или сеть повисли): колонка говорит, что не смогла, а не молчит.
 TURN_TIMEOUT_S = float(os.environ.get("RBX_TURN_TIMEOUT_S", "45"))
 
@@ -906,7 +908,7 @@ async def start_hfp(live: "LiveOut", mic: Mic, ring: "Ring"):
         if up:
             live.stop()  # своя речь в разговор не лезет
             mic.tap = hfp.audio.feed if hfp.audio else None
-            ring.set("connect")
+            ring.set("call")
         else:
             mic.tap = None
             mic.flush()
@@ -1245,12 +1247,28 @@ def load_led_pattern(path: Path):
 class Ring:
     """Кольцо из трёх RGB-диодов (``/sys/class/leds/micro:{red,green,blue}:ring{1,2,3}``): состояние колонки эффектом.
 
-    Слушаю / думаю / говорю / подключаюсь к сети / ошибка — родные анимации Алисы (``RING_PATTERNS``), их нет —
-    эффекты кода (дыхание, бегущий огонёк, пульс). Микрофон выкл — ровный красный, громкость — белые диоды по уровню
-    на 1,2 с. Яркость ``LED_BRIGHT`` из 255: 255 — как у Алисы. В sysfs пишется только изменившееся."""
+    Стиль — ``RBX_RING_STYLE`` (страница настроек, читается на каждом кадре):
 
-    COLORS = {"off": (0, 0, 0), "listen": (0, 0, 1), "think": (1, 0, 1), "speak": (0, 1, 0), "muted": (1, 0, 0),
-              "connect": (1, 1, 1), "error": (1, 0, 0)}
+    * ``color`` (по умолчанию) — эффекты кода, у каждого диода свой цвет (:data:`PALETTES`). Шифу 09.11: «три
+      светодиода, а горят всегда одним цветом — нельзя разноцветно?» — у каждого диода свои R, G, B, можно.
+    * ``alice`` — родные анимации Алисы (``RING_PATTERNS``), где они есть; остальное — эффекты кода.
+
+    Микрофон выкл — ровный красный, громкость — белые диоды по уровню на 1,2 с. Яркость ``LED_BRIGHT`` из 255.
+    В sysfs пишется только изменившееся."""
+
+    #: Состояние → цвета трёх диодов (0..1). Оттенки рядом по кругу, чтобы бегущий огонёк переливался.
+    PALETTES = {
+        "off": ((0, 0, 0),) * 3,
+        "listen": ((0, 0.35, 1), (0, 0.9, 1), (0.35, 0, 1)),  # синий · бирюзовый · фиолетово-синий
+        "think": ((0.8, 0, 1), (1, 0, 0.45), (0.25, 0.1, 1)),  # фиолетовый · малиновый · индиго
+        "speak": ((0, 1, 0.15), (0.45, 1, 0), (0, 0.85, 0.6)),  # зелёный · салатовый · морская волна
+        "connect": ((1, 1, 1), (0.4, 0.7, 1), (1, 1, 1)),
+        "call": ((0, 1, 0.3), (0, 0.55, 1), (0, 1, 0.3)),  # разговор по телефону: зелёный с голубым
+        "muted": ((1, 0, 0),) * 3,
+        "error": ((1, 0, 0), (1, 0.35, 0), (1, 0, 0)),
+    }
+    #: Цвет состояния для экрана без анимации (один на всё кольцо) — первый цвет палитры.
+    COLORS = {state: colors[0] for state, colors in PALETTES.items()}
     FPS = 12
 
     def __init__(self, mic: Mic | None) -> None:
@@ -1296,8 +1314,8 @@ class Ring:
         if self.state == "listen":
             k = 0.25 + 0.75 * (0.5 - 0.5 * math.cos(2 * math.pi * t / 1.6))
             return [k, k, k]
-        if self.state in ("think", "connect"):
-            head = (t / 0.9 * 3) % 3  # огонёк обходит три диода за 0,9 с
+        if self.state in ("think", "connect", "call"):
+            head = (t / (1.6 if self.state == "call" else 0.9) * 3) % 3  # огонёк обходит три диода за 0,9 с
             return [max(0.12, 1 - min(abs(i - head), 3 - abs(i - head))) for i in range(3)]
         if self.state == "speak":
             k = 0.45 + 0.55 * (0.5 - 0.5 * math.cos(2 * math.pi * t / 0.7))
@@ -1326,7 +1344,8 @@ class Ring:
                 self._show([tuple(255 * c for c in rgb) if i < lit else (0, 0, 0) for i in range(3)])
             else:
                 self._override = None
-                pattern = self._patterns.get(self.state)
+                alice = os.environ.get("RBX_RING_STYLE", "color").strip().lower() == "alice"
+                pattern = self._patterns.get(self.state) if alice else None
                 frame = self._pattern_frame(pattern, now - self._since) if pattern else None
                 if frame is not None:
                     self._show(frame)
@@ -1334,8 +1353,11 @@ class Ring:
                 elif pattern is not None:  # одноразовый шаблон (ошибка) кончился
                     self.idle()
                 else:
-                    rgb = self.COLORS[self.state]
-                    self._show([tuple(int(255 * c * k) for c in rgb) for k in self._frame(now - self._since)])
+                    colors = self.PALETTES.get(self.state, self.PALETTES["off"])
+                    if alice:  # стиль Алисы: эффекты кода одним цветом, как раньше
+                        colors = (colors[0],) * 3
+                    self._show([tuple(int(255 * c * k) for c in rgb)
+                                for rgb, k in zip(colors, self._frame(now - self._since))])
                     if self.state in ("off", "muted"):
                         wait = 0.2  # без анимации — реже просыпаться
             await asyncio.sleep(wait)
@@ -1497,7 +1519,8 @@ async def start_setup(stand, mic: Mic, ring: Ring, buttons: "Buttons") -> None:
 
     auth = setup.Auth()
     buttons.auth = auth
-    for name, value in (("RBX_WAKE", ",".join(WAKE_WORDS)), ("RBX_VOLUME", VOLUME), ("RBX_LED", str(LED_BRIGHT))):
+    for name, value in (("RBX_WAKE", ",".join(WAKE_WORDS)), ("RBX_VOLUME", VOLUME), ("RBX_LED", str(LED_BRIGHT)),
+                        ("RBX_RING_STYLE", "color")):
         os.environ.setdefault(name, value)  # форма страницы показывает то, что сейчас в силе
 
     def identify() -> None:
@@ -1517,11 +1540,8 @@ async def start_setup(stand, mic: Mic, ring: Ring, buttons: "Buttons") -> None:
         if keys:  # провайдеры собраны при старте — новые ключи берёт только новый процесс
             asyncio.get_running_loop().call_later(1.0, restart_self, mic)
 
-    improv = setup.Improv(auth, identify, log)
-    try:
-        await improv.start()
-    except Exception as exc:  # noqa: BLE001
-        log(f"📶 Improv не поднялся: {type(exc).__name__}: {exc}")
+    # страница первой и Improv под тайм-аутом: 09.11 BlueZ не ответил на регистрацию Improv (после перезапусков
+    # bluealsa для звонков), ``await improv.start()`` повис — и вместе с ним страница, приветствие и весь слух колонки
     try:
         await setup.SettingsServer(SETTINGS, CORE / "scripts" / "dialogue" / ".env", auth, on_saved, log,
                                    prompts=station_prompts(setup),
@@ -1530,6 +1550,13 @@ async def start_setup(stand, mic: Mic, ring: Ring, buttons: "Buttons") -> None:
                                    on_wifi=lambda ok: wifi_done(ok, ring, mic)).start()
     except OSError as exc:
         log(f"⚙ страница настроек не поднялась: {exc}")
+    improv = setup.Improv(auth, identify, log)
+    try:
+        await asyncio.wait_for(improv.start(), IMPROV_START_S)
+    except asyncio.TimeoutError:
+        log(f"📶 Improv не ответил за {IMPROV_START_S:.0f} с — без Wi-Fi по Bluetooth, остальное работает")
+    except Exception as exc:  # noqa: BLE001
+        log(f"📶 Improv не поднялся: {type(exc).__name__}: {exc}")
 
 
 def wifi_done(ok: bool, ring: "Ring", mic: Mic) -> None:

@@ -55,7 +55,17 @@ def test_psk_ok():
 def test_check_settings_ok():
     out = ss.check_settings({"wake": "Игорёк, игорек", "volume": "230", "led": "60", "voice": "Russian_ReliableMan"})
     assert out == {"RBX_WAKE": "игорёк,игорек", "RBX_VOLUME": "230", "RBX_LED": "60",
-                   "RBX_VOICE": "Russian_ReliableMan"}
+                   "RBX_VOICE": "Russian_ReliableMan", "RBX_RING_STYLE": "color"}
+
+
+def test_ring_style_on_the_page():
+    """09.11: кольцо разноцветное по умолчанию, «как у Алисы» — выбором; чужое значение не сохраняется."""
+    base = {"wake": "игорёк", "volume": "230", "led": "60", "voice": ""}
+    assert ss.check_settings({**base, "ring": "alice"})["RBX_RING_STYLE"] == "alice"
+    with pytest.raises(ValueError):
+        ss.check_settings({**base, "ring": "disco"})
+    page = ss.render_page({"RBX_RING_STYLE": "alice"}, {})
+    assert '<option value="alice" selected>' in page and "разноцветное" in page
 
 
 def test_jovialman_on_the_page():

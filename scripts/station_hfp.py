@@ -17,6 +17,7 @@
 import asyncio
 import os
 import re
+import shlex
 import signal
 import subprocess
 import time
@@ -193,7 +194,10 @@ class CallAudio:
         err = open(CALL_LOG, "ab")  # почему умер звук звонка — в отдельный лог (09.11: «телефон → динамик» умер молча)
         self.up = subprocess.Popen(["aplay", "-q", "-D", self.pcm()] + fmt, stdin=subprocess.PIPE, stderr=err)
         self.down = subprocess.Popen(
-            ["sh", "-c", f"arecord -q -D {self.pcm()} {' '.join(fmt)} | aplay -q -D default {' '.join(fmt)}"],
+            # имя PCM — через shlex.quote: без него оболочка съедала кавычки, и ALSA отвечала
+            # «Unknown PCM plug:bluealsa:DEV=…» (09.11, звонок без звука собеседника)
+            ["sh", "-c", f"arecord -q -D {shlex.quote(self.pcm())} {' '.join(fmt)} | aplay -q -D default "
+                         f"{' '.join(fmt)}"],
             stderr=err, start_new_session=True)  # своя группа: убить и arecord, и aplay
         err.close()
         self.log("📞 звук звонка: микрофон → телефону, телефон → динамик")

@@ -50,6 +50,8 @@ LOG_PATH = Path(os.environ.get("RBX_LOG", "/tmp/station.log"))
 #: Строки, по которым видно, что колонка делала (как в жалобах): остальное — по ``?all=1``.
 LOG_MARKERS = ("🎤", "ход ", "STT", "🔊", "🔔", "🔑", "⚠", "🔘", "⬆", "📮", "📦", "⚙", "📶", "Traceback", "Error",
                "ошибк", "упал", "слушаю", "версия")
+#: Стиль кольца (``station_host.Ring``): свои разноцветные эффекты или родные анимации Алисы (одним цветом).
+RING_STYLES = {"color": "разноцветное", "alice": "как у Алисы"}
 #: Голоса MiniMax для выбора на странице (id → как назвать); пусто — голос по умолчанию.
 VOICES = {"": "по умолчанию", "Russian_ReliableMan": "Надёжный мужчина", "Russian_BrightHeroine": "Яркая героиня",
           "Russian_AttractiveGuy": "Обаятельный парень", "Russian_AmbitiousWoman": "Целеустремлённая женщина",
@@ -195,6 +197,10 @@ def check_settings(form: Dict[str, str]) -> Dict[str, str]:
     if voice not in VOICES:
         raise ValueError("голос: нет в списке")
     out["RBX_VOICE"] = voice
+    style = form.get("ring", "color") or "color"
+    if style not in RING_STYLES:
+        raise ValueError("кольцо: нет такого стиля")
+    out["RBX_RING_STYLE"] = style
     return out
 
 
@@ -318,6 +324,8 @@ def render_page(settings: Dict[str, str], env: Dict[str, str], note: str = "", p
 
     voices = "".join(f'<option value="{html.escape(k)}"{" selected" if k == settings.get("RBX_VOICE", "") else ""}>'
                      f"{html.escape(v)}</option>" for k, v in VOICES.items())
+    rings = "".join(f'<option value="{k}"{" selected" if k == (settings.get("RBX_RING_STYLE") or "color") else ""}>'
+                    f"{html.escape(v)}</option>" for k, v in RING_STYLES.items())
     keys = "".join(f'<label>{k} <small>сейчас {html.escape(mask(env.get(k, "")))}</small>'
                    f'<input name="{k}" type="password" placeholder="пусто — не менять" autocomplete="off"></label>'
                    for k in KEY_NAMES)
@@ -352,6 +360,7 @@ def render_page(settings: Dict[str, str], env: Dict[str, str], note: str = "", p
 <label>Голос<select name="voice">{voices}</select></label>
 {field("Громкость (60–255)", "volume", settings.get("RBX_VOLUME", "230"), "number")}
 {field("Яркость кольца (0–255)", "led", settings.get("RBX_LED", "255"), "number")}
+<label>Кольцо<select name="ring">{rings}</select></label>
 <h3>Ключи</h3>{keys}
 <button type="submit">Сохранить</button></form>{prompt_form}{wifi_form}</body></html>"""
 
@@ -434,7 +443,7 @@ class SettingsServer:
                 "last": self.wifi_last}
 
     async def _page(self, note: str = "") -> str:
-        current = {k: os.environ.get(k, "") for k in ("RBX_WAKE", "RBX_VOLUME", "RBX_LED", "RBX_VOICE")}
+        current = {k: os.environ.get(k, "") for k in ("RBX_WAKE", "RBX_VOLUME", "RBX_LED", "RBX_VOICE", "RBX_RING_STYLE")}
         settings = {**current, **load_settings(self.settings_path)}
         return render_page(settings, read_env(self.env_path), note, self.prompts, await self._wifi_info())
 

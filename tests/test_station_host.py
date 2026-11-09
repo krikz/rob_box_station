@@ -223,3 +223,27 @@ def test_first_heard_takes_first_ok_and_waits_past_failure():
     assert asyncio.run(run(slow_ok, fast_ok, 0.05, 0.0)).text == "гонщик"
     assert asyncio.run(run(slow_ok, st.Heard(error="offline"), 0.05, 0.0)).text == "цепочка"
     assert asyncio.run(run(st.Heard(error="error"), st.Heard(error="offline"), 0.0, 0.01)).ok is False
+
+
+def test_ring_leds_get_different_colors(monkeypatch):
+    """Шифу 09.11: «три светодиода, а горят одним цветом». Стиль color — у диодов разные цвета, alice — один."""
+    shown = []
+    ring = sh.Ring(None)
+    monkeypatch.setattr(ring, "_show", shown.append)
+    monkeypatch.setattr(sh, "LED_BRIGHT", 255)
+
+    async def frame(style):
+        monkeypatch.setenv("RBX_RING_STYLE", style)
+        ring._patterns = {}
+        ring.set("listen")
+        ring._since = sh.time.monotonic() - 0.8  # пик дыхания
+        task = asyncio.ensure_future(ring._run())
+        await asyncio.sleep(0.02)
+        task.cancel()
+        return shown[-1]
+
+    colored = asyncio.run(frame("color"))
+    assert len({tuple(c) for c in colored}) == 3
+    single = asyncio.run(frame("alice"))
+    assert len({tuple(c) for c in single}) == 1
+    assert set(sh.Ring.PALETTES) >= {"listen", "think", "speak", "call", "muted", "error", "off", "connect"}
