@@ -488,7 +488,18 @@ class Hfp:
             return None
         try:
             if not await self.attach():
-                return "Телефон не подключён как гарнитура. Подключи его к колонке по блютузу."
+                # телефон подключён одной музыкой — попросить Hands-Free сейчас, а не ждать фоновой проверки
+                # (09.11 первое «позвони Киру» после перезагрузки ответило «не подключён», HFP встал через 20 с)
+                self._asked.clear()
+                await self.ask_hfp()
+                for _ in range(8):
+                    await asyncio.sleep(1)
+                    if await self.attach():
+                        break
+                else:
+                    return "Телефон не подключён как гарнитура. Подключи его к колонке по блютузу."
+                if action == "dial" and not _NUMBER_RE.match(who):
+                    await self.load_book()
             if action == "hangup":
                 ok, _ = await self.at.ask("AT+CHUP")
                 return "Сбросил." if ok else "Не получилось сбросить."
