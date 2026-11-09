@@ -326,6 +326,9 @@ class Hfp:
         bus = await self._connect()
         intro = await bus.introspect("org.bluealsa", path)
         fd = await bus.get_proxy_object("org.bluealsa", path, intro).get_interface("org.bluealsa.RFCOMM1").call_open()
+        # fd из D-Bus (SCM_RIGHTS) наследуется через exec: 09.11 после самообновления (перезапуск execv) новый хост
+        # держал AT-канал старого, и bluealsa отвечала «Device or resource busy» — звонки не работали
+        os.set_inheritable(fd, False)
         self.device = path.split("/")[-2].replace("dev_", "").replace("_", ":")
         self._device_path = "/org/bluez/hci0/" + path.split("/")[-2]
         self.at = AtChannel(fd, self.log)

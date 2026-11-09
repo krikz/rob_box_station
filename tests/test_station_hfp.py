@@ -273,3 +273,10 @@ def test_call_without_audio_releases_hands_free_and_holds(monkeypatch):
 
     hfp = asyncio.run(run())
     assert released == [True] and hfp.released_until > h.time.time()
+
+
+def test_at_fd_not_inherited_by_exec(monkeypatch):
+    """09.11: после самообновления (execv) новый хост держал AT-канал старого — «Device or resource busy»."""
+    import inspect
+
+    assert "os.set_inheritable(fd, False)" in inspect.getsource(h.Hfp.attach)
