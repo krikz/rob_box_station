@@ -59,6 +59,18 @@ class BtMedia:
         props, iface = await self._props("/org/bluez/hci0", "org.bluez.Adapter1")
         await props.call_set(iface, name, Variant(sig, value))
 
+    async def ensure_alias(self) -> None:
+        """Имя колонки для телефонов — при каждом старте хоста: BlueZ хранит его в ОЗУ, и 09.11 после перезагрузки
+        колонка снова называлась «Яндекс Лайт», хотя телефон Шифу знал её как «Игорёк»."""
+        try:
+            props, iface = await self._props("/org/bluez/hci0", "org.bluez.Adapter1")
+            current = (await props.call_get(iface, "Alias")).value
+            if current != ALIAS:
+                await self._set("Alias", "s", ALIAS)
+                self.log(f"🎵 Bluetooth: имя «{current}» → «{ALIAS}»")
+        except Exception as exc:  # noqa: BLE001 — без BlueZ колонка всё равно работает
+            self.log(f"🎵 Bluetooth: имя не поставлено: {type(exc).__name__}: {exc}")
+
     async def pair(self) -> str:
         """Колонка видна телефону ``PAIR_S`` секунд и принимает сопряжение (агент «just works» — без кода)."""
         await self._set("Alias", "s", ALIAS)

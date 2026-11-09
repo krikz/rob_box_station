@@ -954,6 +954,7 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
     live = LiveOut(stand, voice, mic, ring)
     buttons = Buttons(mic, ring, live)
     bt = station_bt.BtMedia(log)
+    asyncio.ensure_future(bt.ensure_alias())  # имя для телефонов слетает с перезагрузкой
     updater = station_update.Updater(BASE, lambda: os.environ.get("GITHUB_TOKEN", ""), log)
     reporter = stand.rbx_reporter
     kws = station_kws.KwsCollector(KWS_DIR, log)
