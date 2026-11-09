@@ -888,6 +888,19 @@ def install_report_tool(stand, reporter) -> bool:
     return True
 
 
+#: Окно прошлых ходов для модели, токенов. В ядре — 3000 (``TURN_WINDOW_MAX_TOKENS``), и ход, что не влезает, выпадает
+#: ЦЕЛИКОМ: 09.11 «что пишут про Макрона» (поиск, ~4100 токенов в окне) → «а ты что думаешь по этому поводу» —
+#: модель уже не видела новостей и спросила «а повод какой?» (то же — в жалобе #13).
+WINDOW_TOKENS = int(os.environ.get("RBX_WINDOW_TOKENS", "8000"))
+
+
+def widen_window(stand) -> None:
+    """Поднять предел окна журнала ходов (параметр конструктора ``TurnLog`` — менять после сборки стенда)."""
+    log_ = getattr(getattr(stand, "engine", None), "log", None)
+    if log_ is not None and hasattr(log_, "_max_tokens"):
+        log_._max_tokens = max(int(log_._max_tokens), WINDOW_TOKENS)  # noqa: SLF001
+
+
 def make_stand(args: argparse.Namespace):
     import chat  # noqa: PLC0415
 
@@ -905,6 +918,7 @@ def make_stand(args: argparse.Namespace):
     cargs = chat.build_arg_parser().parse_args(["--wake-word"] + (["--db", args.db] if args.db else []))
     stand = chat.build_stand(cargs, Path(args.workdir))
     stand.wake = list(WAKE_WORDS)  # таблица вейков робота (wake_words.yaml) колонке не подходит
+    widen_window(stand)
     install_station_tools(stand)
     import station_report  # noqa: PLC0415  (жалоба в GitHub: «пожалуйся» → issue с логом)
 
