@@ -247,3 +247,40 @@ def test_ring_leds_get_different_colors(monkeypatch):
     single = asyncio.run(frame("alice"))
     assert len({tuple(c) for c in single}) == 1
     assert set(sh.Ring.PALETTES) >= {"listen", "think", "speak", "call", "muted", "error", "off", "connect"}
+
+
+def test_without_wake_anywhere_in_phrase():
+    """09.11: «Набери Кир, Игорёк» (имя в конце) ушло модели, и та «позвонила» словами."""
+    wake = sh.WAKE_WORDS[0]
+    assert sh.without_wake(f"Набери кир {wake}") == "Набери кир"
+    assert sh.without_wake(f"{wake}, набери маму") == "набери маму"
+    assert sh.without_wake("набери маму") is None
+
+
+def test_phone_tool_registered_and_dispatches(monkeypatch):
+    tc, kn = _fake_core(monkeypatch)
+    assert sh.register_tool(sh.PHONE_TOOL, sh.PHONE_TOOL_DESCRIPTION, sh.PHONE_TOOL_PARAMETERS)
+    assert kn.TOOL_CLASSES["phone_call"] == "query" and "phone_call" in kn.TOOLS_ALWAYS
+    asked, spoken = [], []
+
+    class _Hfp:
+        async def handle(self, text):
+            asked.append(text)
+            return "Звоню: Кир."
+
+    class _Live:
+        def speak(self, text):
+            spoken.append(text)
+
+    stand = types.SimpleNamespace(tools=types.SimpleNamespace())
+
+    async def run():
+        sh.install_phone_tool(stand, _Hfp(), _Live())
+        ok, data = stand.tools._t_phone_call({"action": "dial", "who": "Киру"})
+        bad = stand.tools._t_phone_call({"action": "dial"})
+        await asyncio.sleep(0.01)
+        return ok, data, bad
+
+    ok, data, bad = asyncio.run(run())
+    assert ok and data["status"] == "done" and bad[0] is False
+    assert asked == ["набери Киру"] and spoken == ["Звоню: Кир."]

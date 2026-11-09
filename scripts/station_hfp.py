@@ -11,8 +11,8 @@
   настройках Bluetooth телефона (без неё ``+CPBR`` → ``ERROR``). Кодировка — ``AT+CSCS="UTF-8"``.
 
 Решает код (ADR-0148): фразу разбирает :func:`call_command`, контакт ищет :func:`find_contacts`, звонок — AT-команды.
-Звук звонка: ``bluealsa-aplay`` колонки играет SCO телефона в динамик сам (если ему не мешать), микрофон колонки
-хост отдаёт в ``…/hfphf/sink`` (:class:`CallAudio`). Эхоподавления нет — собеседник может слышать себя.
+Звук звонка — см. :data:`CALL_AUDIO`: на этом чипе SCO через HCI вешает Bluetooth, поэтому по умолчанию разговор
+идёт в телефоне, колонка только управляет звонком.
 """
 import asyncio
 import os
@@ -27,6 +27,12 @@ from typing import Callable, List, Optional, Tuple
 CHUNK = 25
 #: Шлюз Hands-Free на телефоне (``Handsfree Audio Gateway`` в ``bluetoothctl info``).
 HFP_AG_UUID = "0000111f-0000-1000-8000-00805f9b34fb"
+#: Звук звонка через колонку. ВЫКЛ по умолчанию: 09.11 на 10.1.1.13 (Bluetooth Amlogic W1 по UART) голос звонка
+#: в HCI не выходит — SCO принято 0 пакетов, отправка встаёт на 43, и чип намертво зависает (дважды, лечится только
+#: перезагрузкой). Отдельной PCM-шины под Bluetooth у звуковой карты нет (TDM — усилитель, PDM — микрофоны).
+#: Без звука колонка набирает, принимает и сбрасывает голосом, а разговор идёт в телефоне. ``RBX_HFP_AUDIO=1`` —
+#: попытка звука на свой риск (для другой ревизии чипа).
+CALL_AUDIO = os.environ.get("RBX_HFP_AUDIO", "0").strip().lower() in ("1", "on", "true", "yes")
 CALL_LOG = Path(os.environ.get("RBX_CALL_LOG", "/tmp/rbx_call.log"))
 #: Во время разговора: раз в столько секунд ``AT+CLCC`` — звонков у телефона нет, значит, разговор кончился, даже
 #: если ``+CIEV`` об этом не дошёл (09.11: хост 3 минуты держал микрофон в «разговоре», которого уже не было).
@@ -70,11 +76,15 @@ def _stem(word: str) -> str:
 def parse_cpbr(line: str) -> Optional[Tuple[str, str]]:
     """``+CPBR: 12,"+79161234567",145,"Кир Петров"`` → (номер, имя)."""
     m = re.match(r'\+CPBR:\s*\d+\s*,\s*"([^"]*)"\s*,\s*\d+\s*,\s*"([^"]*)"', line.strip())
-    return (m.group(1), m.group(2)) if m else None
+    if not m:
+        return None
+    # Android дописывает тип номера: «Кир/M», «Мама/H» (09.11 колонка зачитывала «Кир слэш M»)
+    return m.group(1), re.sub(r"/[A-Z]$", "", m.group(2).strip())
 
 
 def find_contacts(who: str, book: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
-    """Контакты, чьё имя совпало со словами просьбы (по основам: «Киру» → «Кир», «Кирилл»). Точное — первыми."""
+    """Контакты, чьё имя совпало со словами просьбы по основам («Киру» → «Кир»); нет точных — по началу слова
+    («Кир» → «Кирилл»)."""
     want = [_stem(w) for w in re.findall(r"\w+", who) if len(w) >= 2]
     if not want:
         return []
@@ -86,7 +96,8 @@ def find_contacts(who: str, book: List[Tuple[str, str]]) -> List[Tuple[str, str]
         elif all(any(n.startswith(q) for n in words) for q in want):
             prefix.append((number, name))
     seen, out = set(), []
-    for number, name in exact + prefix:
+    # точное имя есть — только оно: 09.11 «позвони Киру» переспрашивало «Кир, …Кириченко, Кирилл …»
+    for number, name in (exact or prefix):
         key = re.sub(r"\D", "", number)[-10:]
         if key not in seen:
             seen.add(key)
@@ -361,7 +372,7 @@ class Hfp:
         self.in_call, self.ringing = up, ""
         if not up:
             self.call_active, self.setup = False, 0
-        if self.audio is not None:
+        if self.audio is not None and (CALL_AUDIO or not up):
             (self.audio.start if up else self.audio.stop)()
         self.log(f"📞 разговор {'начался' if up else 'закончился'}" + (f" ({why})" if why else ""))
         if up:

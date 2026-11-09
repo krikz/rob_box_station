@@ -477,7 +477,9 @@ def kws_wake_text(text: str, label: str, prob: float) -> str:
 #: человек видит, что его услышали. Решения это не меняет — только показ.
 KWS_EARLY_P = float(os.environ.get("RBX_KWS_EARLY_P", "0.6"))
 #: Облако текста не дало, а модель слышит имя с такой уверенностью — «Слушаю.» и окно без вейка, даже в режиме тени.
-KWS_HEARD_P = float(os.environ.get("RBX_KWS_HEARD_P", "0.9"))
+KWS_HEARD_P = float(os.environ.get("RBX_KWS_HEARD_P", "0.95"))
+#: …и только на фразу не длиннее (голое «Игорёк» — 1–2 с; 12 с — это шум или телевизор).
+KWS_HEARD_MAX_S = float(os.environ.get("RBX_KWS_HEARD_MAX_S", "3"))
 
 
 def _lev(a: str, b: str) -> int:
@@ -570,8 +572,9 @@ def device_facts() -> str:
             "- Complaints and bug reports for your developers: you CAN file them yourself with the `report_issue` tool "
             "(a GitHub issue with your log). Use it when the person asks to complain, report a bug or pass something "
             "to the developers — never say you cannot. Never use it on your own initiative.\n"
-            "- Phone calls go through the person's phone by Bluetooth, and your code places them: «Игорёк, набери "
-            "Кира» / «позвони маме», «прими», «сбрось» (or the Alice button). Tell people these words when asked.\n"
+            "- Phone calls go through the person's phone by Bluetooth: use the `phone_call` tool (dial / answer / "
+            "hangup). Never say «звоню» or «набираю» without calling it — 09.11 you said «Звоню Киру» and nothing "
+            "was dialled. The code announces who it dials; you add nothing after the tool.\n"
             + JOKE_RULES)
 
 
@@ -736,6 +739,67 @@ REPORT_TOOL_PARAMETERS = {
 }
 
 
+def register_tool(name: str, description: str, parameters: dict) -> bool:
+    """Дописать тул модели в каталог ядра при старте (каталог неизменяемый — ``MappingProxyType``): запись,
+    класс ``query`` и «виден всегда». Повторный вызов — ничего не делает."""
+    from types import MappingProxyType  # noqa: PLC0415
+
+    try:
+        from rob_box_core import tool_catalog as tc  # noqa: PLC0415
+        from rob_box_dialog import knowledge as kn  # noqa: PLC0415
+    except ImportError as exc:
+        log(f"🧰 тул {name} не поставлен: {exc}")
+        return False
+    if name not in tc._BY_NAME:  # noqa: SLF001
+        entry = tc.ToolCatalogEntry(name=name, description=description, parameters=MappingProxyType(dict(parameters)),
+                                    read_only=False, destructive=False, idempotent=False, skill=(tc.CORE_SKILL,))
+        tc.TOOL_CATALOG = tc.TOOL_CATALOG + (entry,)
+        tc._BY_NAME = MappingProxyType({**tc._BY_NAME, name: entry})  # noqa: SLF001
+        kn.TOOL_CLASSES = MappingProxyType({**kn.TOOL_CLASSES, name: "query"})
+        kn.TOOLS_ALWAYS = tuple(kn.TOOLS_ALWAYS) + (name,)
+    return True
+
+
+PHONE_TOOL = "phone_call"
+PHONE_TOOL_DESCRIPTION = (
+    "Place, answer or end a phone call through the person's phone connected to you by Bluetooth. Call it whenever "
+    "the person asks to call someone («позвони Киру», «набери маму», a number), to answer («прими») or to hang up "
+    "(«сбрось»). NEVER say you are calling without calling this tool. Your code finds the contact and announces "
+    "the result itself (who it dials, or that it found several) — after the tool say nothing or one short word.")
+PHONE_TOOL_PARAMETERS = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": ["dial", "answer", "hangup"]},
+        "who": {"type": "string", "description": "Contact name as the person said it (Russian), or a phone number. "
+                "Only for dial."},
+    },
+    "required": ["action"],
+}
+
+
+def install_phone_tool(stand, hfp, live: "LiveOut") -> None:
+    """Обработчик ``phone_call``: AT-команды идут в фоне (тул синхронный), фразу итога говорит код."""
+    def call(args: dict) -> tuple:
+        action = str(args.get("action") or "")
+        who = str(args.get("who") or "").strip()
+        if hfp is None:
+            return False, {"status": "rejected", "reason": "unavailable", "detail": "звонки выключены (RBX_HFP=0)"}
+        phrase = {"dial": f"набери {who}", "answer": "прими", "hangup": "сбрось"}.get(action, "")
+        if not phrase or (action == "dial" and not who):
+            return False, {"status": "rejected", "reason": "bad_args", "detail": "кому звонить?"}
+        log(f"📞 тул {PHONE_TOOL}: {action} «{who}»")
+
+        async def run() -> None:
+            reply = await hfp.handle(phrase)
+            if reply:
+                live.speak(reply)
+
+        asyncio.ensure_future(run())
+        return True, {"status": "done", "note": "колонка набирает и сама скажет, кому звонит"}
+
+    stand.tools._t_phone_call = call
+
+
 def register_report_tool() -> bool:
     """Тул модели ``report_issue`` (Шифу 09.11: «код не всегда подхватывает, а модель тупит и говорит, что не может
     жалобу создать — надо дать инструмент модели»).
@@ -746,23 +810,7 @@ def register_report_tool() -> bool:
     Разбор фразы кодом («пожалуйся, что…») остаётся первым: он быстрее и не зависит от модели.
     TODO: место тулу — ядро колонки (ADR-0167), когда ядро станет пакетом.
     """
-    from types import MappingProxyType  # noqa: PLC0415
-
-    try:
-        from rob_box_core import tool_catalog as tc  # noqa: PLC0415
-        from rob_box_dialog import knowledge as kn  # noqa: PLC0415
-    except ImportError as exc:
-        log(f"📮 тул {REPORT_TOOL} не поставлен: {exc}")
-        return False
-    if REPORT_TOOL not in tc._BY_NAME:  # noqa: SLF001
-        entry = tc.ToolCatalogEntry(name=REPORT_TOOL, description=REPORT_TOOL_DESCRIPTION,
-                                    parameters=MappingProxyType(dict(REPORT_TOOL_PARAMETERS)), read_only=False,
-                                    destructive=False, idempotent=False, skill=(tc.CORE_SKILL,))
-        tc.TOOL_CATALOG = tc.TOOL_CATALOG + (entry,)
-        tc._BY_NAME = MappingProxyType({**tc._BY_NAME, REPORT_TOOL: entry})  # noqa: SLF001
-        kn.TOOL_CLASSES = MappingProxyType({**kn.TOOL_CLASSES, REPORT_TOOL: "query"})
-        kn.TOOLS_ALWAYS = tuple(kn.TOOLS_ALWAYS) + (REPORT_TOOL,)
-    return True
+    return register_tool(REPORT_TOOL, REPORT_TOOL_DESCRIPTION, REPORT_TOOL_PARAMETERS)
 
 
 def install_report_tool(stand, reporter) -> bool:
@@ -799,6 +847,8 @@ def make_stand(args: argparse.Namespace):
         f"{', дополнение ' + str(len(prompts.extra().strip())) + ' знаков' if prompts.extra().strip() else ''}")
     t0 = time.time()
     register_report_tool()  # до сборки стенда: срез тулов не должен успеть закэшироваться без него
+    if os.environ.get("RBX_HFP", "1").strip().lower() not in ("0", "off", "false", "no"):
+        register_tool(PHONE_TOOL, PHONE_TOOL_DESCRIPTION, PHONE_TOOL_PARAMETERS)
     cargs = chat.build_arg_parser().parse_args(["--wake-word"] + (["--db", args.db] if args.db else []))
     stand = chat.build_stand(cargs, Path(args.workdir))
     stand.wake = list(WAKE_WORDS)  # таблица вейков робота (wake_words.yaml) колонке не подходит
@@ -844,16 +894,27 @@ async def first_heard(chain_task: asyncio.Future, sprint_task: asyncio.Future):
     return last
 
 
+def without_wake(text: str) -> "str | None":
+    """Фраза без имени колонки, если имя в ней есть (в начале, в конце или в середине); нет имени — ``None``.
+
+    09.11: «Набери Кир, Игорёк» (имя в конце) ушло модели, и та ответила «Звоню Киру», ничего не набрав.
+    """
+    words = text.split()
+    keep = [w for w in words if w.lower().strip(",.!?;:«»") not in WAKE_WORDS]
+    if len(keep) == len(words):
+        return None
+    return " ".join(keep).strip(" ,.!?;:")
+
+
 async def code_command(text: str, live: "LiveOut", updater, reporter, bt, mic: Mic, hfp=None) -> bool:
     """Команды, которые решает код (ADR-0148), — после вейка: обновление, жалоба, звонок, Bluetooth.
     Выполнил — ``True``."""
     import station_report  # noqa: PLC0415
     import station_update  # noqa: PLC0415
 
-    words = text.split()
-    if not words or words[0].lower().strip(",.!?") not in WAKE_WORDS:
+    rest = without_wake(text)
+    if rest is None:
         return False
-    rest = " ".join(words[1:])
     command = station_update.update_command(rest)
     if command:  # обновление: «проверь» — только рассказать, «обновись» — поставить
         live.earcon()
@@ -907,7 +968,8 @@ async def start_hfp(live: "LiveOut", mic: Mic, ring: "Ring"):
     def on_call(up: bool) -> None:
         if up:
             live.stop()  # своя речь в разговор не лезет
-            mic.tap = hfp.audio.feed if hfp.audio else None
+            # со звуком через колонку микрофон уходит в звонок; без звука — колонка слушает дальше («Игорёк, сбрось»)
+            mic.tap = hfp.audio.feed if hfp.audio and station_hfp.CALL_AUDIO else None
             ring.set("call")
         else:
             mic.tap = None
@@ -963,6 +1025,7 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
     log(f"версия колонки: {version}")
     hfp = await start_hfp(live, mic, ring)
     buttons.hfp = hfp
+    install_phone_tool(stand, hfp, live)
     Keys(asyncio.get_running_loop(), buttons.on_key)
     await start_setup(stand, mic, ring, buttons)
     announce_start(live, version)
@@ -997,8 +1060,11 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
                 continue
             kws.observe(pcm, text, WAKE_WORDS, label, prob, heard.provider, now=t1)
             if not text:
-                if kws_wake(label, prob) or (label == KWS_WAKE_LABEL and prob >= KWS_HEARD_P) or armed:
-                    # облако текста не дало, а имя (или кнопку) слышно — коротко ответить и ждать фразу без вейка
+                # облако текста не дало, а своя модель слышит голое имя — коротко ответить и ждать фразу без вейка.
+                # Только на короткую фразу и не внутри уже открытого окна: 09.11 шум 12 с дал «igorek 0.97» →
+                # «Слушаю», а эхо этого «Слушаю» в открытом окне — снова «Слушаю», и так по кругу
+                short = len(pcm) / 2 / RATE <= KWS_HEARD_MAX_S
+                if not armed and short and (kws_wake(label, prob) or (label == KWS_WAKE_LABEL and prob >= KWS_HEARD_P)):
                     live.earcon()
                     live.say_offline("heard")
                     await live.drain()

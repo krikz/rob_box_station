@@ -29,6 +29,14 @@ def test_call_command_forms():
 def test_parse_cpbr():
     assert h.parse_cpbr('+CPBR: 12,"+79161234567",145,"Кир Петров"') == ("+79161234567", "Кир Петров")
     assert h.parse_cpbr("+CPBS: \"ME\",1,2") is None
+    # 09.11 Redmi: тип номера в имени — колонка зачитывала «Кир слэш M»
+    assert h.parse_cpbr('+CPBR: 7,"+79160000000",129,"Кир/M"') == ("+79160000000", "Кир")
+
+
+def test_exact_name_beats_similar_ones():
+    """09.11 живьём: «позвони Киру» → «нашёл несколько: Кир, …Кириченко, Кирилл …». Есть точный «Кир» — звоним ему."""
+    book = [("1", "Кир"), ("2", "Елена Мама Даши Кириченко 1А"), ("3", "Кирилл Батайск")]
+    assert h.find_contacts("Киру", book) == [("1", "Кир")]
 
 
 def test_find_contacts_by_stem_and_dedup():
@@ -36,7 +44,8 @@ def test_find_contacts_by_stem_and_dedup():
     found = h.find_contacts("Киру", BOOK)
     assert found[0] == ("+79161112233", "Кир Петров")
     assert [n for _, n in found].count("Кир Петров") == 1
-    assert "Кирилл Работа" in [n for _, n in found]
+    assert "Кирилл Работа" not in [n for _, n in found]  # точные есть — похожие не мешают
+    assert h.find_contacts("Кирил", BOOK) == [("+79160000001", "Кирилл Работа")]  # точных нет — по началу
     assert h.find_contacts("маме", BOOK) == [("+79165556677", "Мама")]
     assert h.find_contacts("Вася", BOOK) == []
 
@@ -220,3 +229,25 @@ def test_watchdog_keeps_live_call(monkeypatch):
 
     still, calls = asyncio.run(run())
     assert still and calls == [True]
+
+
+def test_call_audio_off_by_default_never_opens_sco(monkeypatch):
+    """09.11: SCO через HCI вешает чип Amlogic W1 — по умолчанию колонка звук звонка не трогает."""
+    monkeypatch.setattr(h, "CALL_AUDIO", False)
+    started = []
+
+    class _Audio:
+        def start(self):
+            started.append("start")
+
+        def stop(self):
+            started.append("stop")
+
+    hfp, calls = _hfp()
+    hfp.audio = _Audio()
+    hfp._ciev("+CIEV: 2,2")
+    hfp._ciev("+CIEV: 2,0")
+    assert calls == [True, False] and started == ["stop"]
+    monkeypatch.setattr(h, "CALL_AUDIO", True)
+    hfp._ciev("+CIEV: 1,1")
+    assert started == ["stop", "start"]
