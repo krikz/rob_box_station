@@ -55,12 +55,35 @@ def test_key_for_and_missing_file(tmp_path):
 
 
 def test_tones_are_audio():
-    for kind in ("error", "ok", "tick"):
+    for kind in ("error", "ok", "tick", "connect", "disconnect"):
         pcm = so.tone(kind)
         assert len(pcm) > 1000 and len(pcm) % 2 == 0
 
 
 def test_phrases_cover_host_keys():
     for key in ("started", "heard", "no_net", "stt_fail", "stt_limited", "llm_fail", "tts_fail", "mic_off",
-                "mic_on", "restarting"):
+                "mic_on", "restarting", "bt_on", "bt_off"):
         assert so.PHRASES[key]
+
+
+def test_variants_rotate_without_immediate_repeat(tmp_path):
+    """Шифу 09.11: «делай вариации, чтоб было несколько, а не однотипно каждый раз»."""
+    calls: list = []
+    cache = so.OfflinePhrases(tmp_path, print, {"hi": ["Привет.", "Здравствуй.", "Хай."]})
+    assert asyncio.run(cache.refresh(_synth(calls), "V")) == 3
+    picked = [cache.pick("hi") for _ in range(30)]
+    assert all(a[0] != b[0] for a, b in zip(picked, picked[1:]))  # подряд — не тот же
+    assert {vid for vid, _ in picked} == {"hi", "hi.1", "hi.2"}
+    assert cache.pcm("hi.2") == "V:Хай.".encode() and cache.pcm("hi") is not None
+
+
+def test_first_variant_reuses_old_single_file(tmp_path):
+    """Нулевой вариант — прежнее имя файла: уже синтезированные фразы не пересинтезируются."""
+    calls: list = []
+    asyncio.run(so.OfflinePhrases(tmp_path, print, {"hi": "Привет."}).refresh(_synth(calls), "V"))
+    cache = so.OfflinePhrases(tmp_path, print, {"hi": ["Привет.", "Здравствуй."]})
+    assert cache.missing("V") == ["hi.1"]
+
+
+def test_every_phrase_has_variants():
+    assert all(len(v) >= 2 for v in so.PHRASES.values())

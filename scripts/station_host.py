@@ -1017,12 +1017,22 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
     buttons = Buttons(mic, ring, live)
     bt = station_bt.BtMedia(log)
     asyncio.ensure_future(bt.ensure_alias())  # имя для телефонов слетает с перезагрузкой
+
+    def on_bt(name: str, up: bool) -> None:
+        """Телефон подключился — перезвон и «Телефон подключён»; отключился — две ноты вниз и «отключён»."""
+        live.tone("connect" if up else "disconnect")
+        live.say_offline("bt_on" if up else "bt_off")
+
     updater = station_update.Updater(BASE, lambda: os.environ.get("GITHUB_TOKEN", ""), log)
     reporter = stand.rbx_reporter
     kws = station_kws.KwsCollector(KWS_DIR, log)
     asyncio.get_running_loop().call_later(30, station_update.OK_MARK.touch)  # «здоров» — сторож отката не нужен
     version = updater.current()
     log(f"версия колонки: {version}")
+    try:
+        await bt.watch_connections(on_bt)
+    except Exception as exc:  # noqa: BLE001 — без BlueZ колонка работает и так
+        log(f"🎵 Bluetooth: не слежу за подключениями: {type(exc).__name__}: {exc}")
     hfp = await start_hfp(live, mic, ring)
     buttons.hfp = hfp
     install_phone_tool(stand, hfp, live)
@@ -1240,8 +1250,9 @@ class LiveOut:
         self._queue.put_nowait((text, self.voice(), key))
 
     def say_offline(self, key: str) -> None:
-        """Офлайн-фраза по ключу: файл есть — звучит сразу, нет — синтезом (сеть есть) или тоном ошибки."""
-        self.speak(self.offline.text(key) or key, key)
+        """Офлайн-фраза по ключу, случайным вариантом: файл есть — звучит сразу, нет — синтезом или тоном."""
+        vid, text = self.offline.pick(key)
+        self.speak(text or key, vid or key)
 
     def tone(self, kind: str) -> None:
         self._queue.put_nowait((kind, None, "tone"))
