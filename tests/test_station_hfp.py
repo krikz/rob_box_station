@@ -251,3 +251,25 @@ def test_call_audio_off_by_default_never_opens_sco(monkeypatch):
     monkeypatch.setattr(h, "CALL_AUDIO", True)
     hfp._ciev("+CIEV: 1,1")
     assert started == ["stop", "start"]
+
+
+def test_call_without_audio_releases_hands_free_and_holds(monkeypatch):
+    """Шифу 09.11: «пока подключена гарнитура, в телефоне ничего не слышно, даже если выбрать телефон» —
+    через секунду после начала звонка колонка отпускает Hands-Free и обратно не просит, пока держит паузу."""
+    monkeypatch.setattr(h, "CALL_AUDIO", False)
+    released = []
+
+    async def run():
+        hfp, calls = _hfp()
+
+        async def release():
+            released.append(True)
+            hfp.released_until = h.time.time() + 600
+
+        hfp.release = release
+        hfp._ciev("+CIEV: 2,2")
+        await asyncio.sleep(1.2)
+        return hfp
+
+    hfp = asyncio.run(run())
+    assert released == [True] and hfp.released_until > h.time.time()

@@ -33,6 +33,11 @@ HFP_AG_UUID = "0000111f-0000-1000-8000-00805f9b34fb"
 #: Без звука колонка набирает, принимает и сбрасывает голосом, а разговор идёт в телефоне. ``RBX_HFP_AUDIO=1`` —
 #: попытка звука на свой риск (для другой ревизии чипа).
 CALL_AUDIO = os.environ.get("RBX_HFP_AUDIO", "0").strip().lower() in ("1", "on", "true", "yes")
+#: Без звука через колонку телефон всё равно ведёт разговор «в гарнитуру» — и тишина даже при выборе «телефон»
+#: (Шифу 09.11). Поэтому через секунду после начала звонка колонка ОТПУСКАЕТ Hands-Free (``DisconnectProfile``):
+#: разговор остаётся в телефоне, музыка (A2DP) — подключена. Обратно Hands-Free — по команде звонка или через
+#: ``RELEASE_HOLD_S``; тогда, если звонок ещё идёт (``AT+CLCC``), — снова отпустить.
+RELEASE_HOLD_S = float(os.environ.get("RBX_HFP_RELEASE_HOLD_S", "600"))
 CALL_LOG = Path(os.environ.get("RBX_CALL_LOG", "/tmp/rbx_call.log"))
 #: Во время разговора: раз в столько секунд ``AT+CLCC`` — звонков у телефона нет, значит, разговор кончился, даже
 #: если ``+CIEV`` об этом не дошёл (09.11: хост 3 минуты держал микрофон в «разговоре», которого уже не было).
@@ -266,6 +271,8 @@ class Hfp:
         self.audio: Optional[CallAudio] = None
         self._task: Optional[asyncio.Task] = None
         self._asked: dict = {}  # устройство → когда просили Hands-Free
+        self.released_until = 0.0  # отпустили Hands-Free на время звонка: до этого момента обратно не просим
+        self._device_path = ""  # /org/bluez/hci0/dev_… телефона на HFP
 
     # ------------------------------------------------------------------ bluealsa
 
@@ -318,21 +325,29 @@ class Hfp:
         intro = await bus.introspect("org.bluealsa", path)
         fd = await bus.get_proxy_object("org.bluealsa", path, intro).get_interface("org.bluealsa.RFCOMM1").call_open()
         self.device = path.split("/")[-2].replace("dev_", "").replace("_", ":")
+        self._device_path = "/org/bluez/hci0/" + path.split("/")[-2]
         self.at = AtChannel(fd, self.log)
         await self.at.ask("AT+CLIP=1")  # номер входящего в «+CLIP»
         await self.at.ask('AT+CSCS="UTF-8"')
         self.audio = CallAudio(self.device, self.log)
         self._task = asyncio.ensure_future(self._events())
         self.log(f"📞 телефон {self.device} на связи (HFP)")
+        if not CALL_AUDIO:
+            ok, lines = await self.at.ask("AT+CLCC", timeout=3)
+            if ok and any(l.startswith("+CLCC") for l in lines):  # звонок ещё идёт — звук оставить телефону
+                self.log("📞 звонок ещё идёт — снова отпускаю Hands-Free")
+                asyncio.ensure_future(self.release())
         return True
 
     async def _events(self) -> None:
         while self.at is not None:
             line = await self.at.events.get()
             if line == "DISCONNECTED":
-                self.log("📞 телефон отключился")
+                released = time.time() < self.released_until
+                self.log("📞 AT-канал закрыт: Hands-Free отпущен, разговор в телефоне" if released
+                         else "📞 телефон отключился")
                 self.at = None
-                self._set_call(False)
+                self._set_call(False, "Hands-Free отпущен" if released else "")
                 return
             if line.startswith(("RING", "+CLIP", "+CIEV: 1,", "+CIEV: 2,", "NO CARRIER", "BUSY")):
                 self.log(f"📞 телефон: {re.sub(r'[0-9]{4,}', '…', line)}")  # номер в лог не пишем
@@ -377,10 +392,29 @@ class Hfp:
         self.log(f"📞 разговор {'начался' if up else 'закончился'}" + (f" ({why})" if why else ""))
         if up:
             try:
-                asyncio.get_running_loop().create_task(self._watch_call())
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._watch_call())
+                if not CALL_AUDIO:
+                    loop.call_later(1.0, lambda: asyncio.ensure_future(self.release()))
             except RuntimeError:  # без цикла (проверка индикаторов в тестах) — без сторожа
                 pass
         self.on_call(up)
+
+    async def release(self) -> None:
+        """Отпустить Hands-Free у телефона: разговор остаётся в телефоне (см. :data:`RELEASE_HOLD_S`)."""
+        self.released_until = time.time() + RELEASE_HOLD_S
+        path = self._device_path
+        if not path:
+            return
+        try:
+            bus = await self._connect()
+            intro = await bus.introspect("org.bluez", path)
+            device = bus.get_proxy_object("org.bluez", path, intro).get_interface("org.bluez.Device1")
+            await device.call_disconnect_profile(HFP_AG_UUID)
+            self.log(f"📞 отпустил Hands-Free: разговор — в телефоне (обратно через {RELEASE_HOLD_S / 60:.0f} мин "
+                     "или по команде звонка)")
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"📞 Hands-Free не отпустился: {type(exc).__name__}: {exc}")
 
     async def _watch_call(self) -> None:
         """Сторож разговора: ``AT+CLCC`` без звонков дважды подряд или пропал AT-канал — разговор окончен."""
@@ -409,7 +443,7 @@ class Hfp:
         """Фоном: телефон подключился — открыть AT-канал и подтянуть книгу (первый «набери» без ожидания)."""
         while True:
             try:
-                if self.at is None and not await self.attach():
+                if self.at is None and time.time() >= self.released_until and not await self.attach():
                     await self.ask_hfp()
                 if self.at is not None and not self.book:
                     await self.load_book()
@@ -491,6 +525,7 @@ class Hfp:
                 # телефон подключён одной музыкой — попросить Hands-Free сейчас, а не ждать фоновой проверки
                 # (09.11 первое «позвони Киру» после перезагрузки ответило «не подключён», HFP встал через 20 с)
                 self._asked.clear()
+                self.released_until = 0.0  # человек сам просит звонок — Hands-Free нужен сейчас
                 await self.ask_hfp()
                 for _ in range(8):
                     await asyncio.sleep(1)
