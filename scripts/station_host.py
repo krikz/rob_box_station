@@ -921,7 +921,10 @@ async def code_command(text: str, live: "LiveOut", updater, reporter, bt, mic: M
         if live._ring:  # noqa: SLF001
             live._ring.set("think")  # noqa: SLF001  (GitHub отвечает секунды — видно, что колонка занята)
         tag, phrase = await asyncio.to_thread(updater.latest)
-        live.speak(phrase + (" Скажи «Игорёк, обновись», чтобы поставить." if tag and command == "check" else ""))
+        if command == "check" or not tag:
+            # сводку «что нового» — только на «проверь» (или если ставить нечего: «обновлений нет»)
+            live.speak(phrase + (" Скажи «Игорёк, обновись», чтобы поставить." if tag else ""))
+        # «обновись» — сразу ставить, без второй сводки: 09.11 Шифу «читает то же самое ещё раз, это очень бесит»
         done = await asyncio.to_thread(updater.install, tag) if tag and command == "install" else ""
         if tag and command == "install":
             live.speak(done or "Не смог скачать обновление, попробуй позже.")
