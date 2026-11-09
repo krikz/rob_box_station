@@ -412,3 +412,11 @@ def test_deaf_watchdog_leaves_phone_call_alone(monkeypatch):
 
     asyncio.run(run())
     assert mic.muted is True
+
+
+def test_window_widened_for_search_turns():
+    """09.11: ход с поиском (~4100 токенов) не влезал в окно ядра (3000) и выпадал целиком — «а повод какой?»."""
+    log_ = types.SimpleNamespace(_max_tokens=3000)
+    sh.widen_window(types.SimpleNamespace(engine=types.SimpleNamespace(log=log_)))
+    assert log_._max_tokens == sh.WINDOW_TOKENS >= 8000
+    sh.widen_window(types.SimpleNamespace())  # без журнала — молча
