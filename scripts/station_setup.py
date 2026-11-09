@@ -43,8 +43,13 @@ HTTP_PORT = int(os.environ.get("RBX_HTTP_PORT", "8080"))
 #: а лишнее поле только сбивало — 08.11 отозванный токен из него ронял обновления в 401 (issue #11).
 #: Если репозиторий когда-нибудь закроют, GITHUB_TOKEN вписывается в ``.env`` руками.
 #: YANDEX_API_KEY — распознавание и синтез Яндекса; JEV_API_KEY — чойсер.
-KEY_NAMES = ("DEEPSEEK_API_KEY", "MINIMAX_API_KEY", "MINIMAX_GROUP_ID", "YANDEX_API_KEY", "JEV_API_KEY",
-             "GH_ISSUE_TOKEN")
+KEY_NAMES = ("DEEPSEEK_API_KEY", "MINIMAX_API_KEY", "MINIMAX_GROUP_ID", "YANDEX_API_KEY", "YANDEX_FOLDER_ID",
+             "JEV_API_KEY", "GH_ISSUE_TOKEN")
+#: Лог хоста для страницы ``/log`` (#17): текущий прогон и прошлый (``.1`` — до перезапуска).
+LOG_PATH = Path(os.environ.get("RBX_LOG", "/tmp/station.log"))
+#: Строки, по которым видно, что колонка делала (как в жалобах): остальное — по ``?all=1``.
+LOG_MARKERS = ("🎤", "ход ", "STT", "🔊", "🔔", "🔑", "⚠", "🔘", "⬆", "📮", "📦", "⚙", "📶", "Traceback", "Error",
+               "ошибк", "упал", "слушаю", "версия")
 #: Голоса MiniMax для выбора на странице (id → как назвать); пусто — голос по умолчанию.
 VOICES = {"": "по умолчанию", "Russian_ReliableMan": "Надёжный мужчина", "Russian_BrightHeroine": "Яркая героиня",
           "Russian_AttractiveGuy": "Обаятельный парень", "Russian_AmbitiousWoman": "Целеустремлённая женщина",
@@ -341,6 +346,7 @@ def render_page(settings: Dict[str, str], env: Dict[str, str], note: str = "", p
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Колонка Игорёк</title>
 <style>{STYLE}</style></head><body><h1>Колонка «Игорёк»</h1>{msg}
 <p>Чтобы сохранить что-либо: нажми любую кнопку на колонке, потом кнопку на странице (на это минута).</p>
+<p><a href="/log">Лог колонки</a> — что она слышала, что ответила, что сломалось.</p>
 <h2>Основное</h2><form method="post" action="/save">
 {field("Вейк-слова (через запятую)", "wake", settings.get("RBX_WAKE", ""))}
 <label>Голос<select name="voice">{voices}</select></label>
@@ -348,6 +354,33 @@ def render_page(settings: Dict[str, str], env: Dict[str, str], note: str = "", p
 {field("Яркость кольца (0–255)", "led", settings.get("RBX_LED", "255"), "number")}
 <h3>Ключи</h3>{keys}
 <button type="submit">Сохранить</button></form>{prompt_form}{wifi_form}</body></html>"""
+
+
+def log_tail(path: Path, everything: bool = False, limit: int = 400) -> List[str]:
+    """Хвост лога хоста (прошлый прогон, потом текущий), секреты замаскированы; без ``everything`` — значимые строки."""
+    import station_report  # noqa: PLC0415  (маска секретов — одна на жалобы и страницу)
+
+    lines: List[str] = []
+    for p in (path.with_name(path.name + ".1"), path):
+        try:
+            lines += p.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+    if not everything:
+        lines = [line for line in lines if any(k in line for k in LOG_MARKERS)]
+    return [station_report.mask_secrets(line) for line in lines[-limit:]]
+
+
+def render_log(path: Path, everything: bool = False) -> str:
+    """Страница ``/log`` (#17: «нет возможности увидеть логи на странице настроек»): свежее — сверху, обновление 10 с."""
+    lines = log_tail(path, everything)
+    body = html.escape("\n".join(reversed(lines))) or "лог пуст"
+    other = ('<a href="/log">только значимое</a>' if everything else '<a href="/log?all=1">все строки</a>')
+    return f"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="10">
+<title>Лог колонки</title><style>{STYLE}pre{{white-space:pre-wrap;word-break:break-word;font:12px ui-monospace,
+monospace}}body{{max-width:900px}}</style></head><body><h1>Лог колонки</h1><p><a href="/">← настройки</a> · {other}
+· <small>свежее сверху, страница обновляется каждые 10 с; ключи скрыты</small></p><pre>{body}</pre></body></html>"""
 
 
 # ---------------------------------------------------------------- HTTP
@@ -408,6 +441,9 @@ class SettingsServer:
     async def _handle(self, method: str, target: str, body: bytes) -> Tuple[str, str]:
         if method == "GET" and target.split("?")[0] == "/":
             return "200 OK", await self._page()
+        if method == "GET" and target.split("?")[0] == "/log":
+            query = urllib.parse.parse_qs(target.partition("?")[2])
+            return "200 OK", render_log(LOG_PATH, query.get("all") == ["1"])
         if method != "POST" or target not in ("/save", "/prompt", "/wifi"):
             return "404 Not Found", "not found"
         form = {k: v[0] for k, v in urllib.parse.parse_qs(body.decode("utf-8"), keep_blank_values=True).items()}

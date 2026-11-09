@@ -132,3 +132,18 @@ def test_scan_ssids_sorted_unique_no_hidden():
             "aa\t2412\t-70\t[WPA2]\tROS2\nbb\t2437\t-40\t[WPA2]\tМастерская\ncc\t2412\t-50\t[WPA2]\tROS2\n"
             "dd\t2412\t-30\t[WPA2]\t\n")
     assert ss.scan_ssids(text) == ["Мастерская", "ROS2"]
+
+
+def test_log_page_masks_secrets_and_shows_newest_first(tmp_path):
+    """#17: лог на странице — свежее сверху, ключи скрыты, без ?all=1 — только значимое."""
+    import station_setup as ss_mod
+
+    log = tmp_path / "station.log"
+    (tmp_path / "station.log.1").write_text("09:00:00 🎤 старый прогон\n", encoding="utf-8")
+    log.write_text("10:00:00 🎤 первая\nкольцо кадр\n10:00:05 ход 1 с: MINIMAX_API_KEY=sk-abcdefghijklmnopqrstu\n",
+                   encoding="utf-8")
+    page = ss_mod.render_log(log)
+
+    assert page.index("ход 1 с") < page.index("первая") < page.index("старый прогон")
+    assert "sk-abcdefghijklmnopqrstu" not in page and "кольцо кадр" not in page
+    assert "кольцо кадр" in ss_mod.render_log(log, everything=True)

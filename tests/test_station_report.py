@@ -256,3 +256,49 @@ def test_state_file_survives_new_process(tmp_path, posted):
     assert state["hash"] and state["at"] > 0 and state["issue"].endswith("/issues/1")
     assert "уже отправил" in _reporter(tmp_path).file("не слышишь меня")
     assert len(posted) == 1
+
+
+def test_other_complaint_allowed_after_short_gap(tmp_path, posted, monkeypatch):
+    """#16: другая жалоба через 2 мин получила «подожди 8 мин» и потерялась. Разные — после короткой паузы."""
+    reporter = _reporter(tmp_path)
+    reporter.file("не слышишь меня")
+    state = reporter.state()
+    reporter.save({**state, "at": state["at"] - sr.GAP_S - 1})
+
+    assert "номер 2" in reporter.file("музыка обрывается") and len(posted) == 2
+
+
+def test_developers_plural_and_complain_forms_trigger():
+    """#16: «передай разработчикам, что…» не ловилось (только «разработчику») и ушло модели — та «запомнила»."""
+    assert sr.report_command("передай разработчикам, что нет звонков по Bluetooth") == (
+        "file", "что нет звонков по Bluetooth")
+    assert sr.report_command("я тебе жалуюсь на твою работу")[0] == "file"
+    assert sr.report_command("скажи разработчику что лога нет")[0] == "file"
+    assert sr.report_command("расскажи про разработчиков игр") == ("", "")
+
+
+def test_tool_path_builds_body_without_second_model_call(tmp_path, posted):
+    """Тул модели: заголовок и суть от модели, цитата, версия и лог — кодом; второго вызова LLM нет."""
+    log = tmp_path / "station.log"
+    log.write_text("10:00:01 🎤 1.0 с → STT 1 с: «Игорёк, покажи логи»\n10:00:02 кольцо кадр\n", encoding="utf-8")
+    called = []
+    reporter = _reporter(tmp_path, log_paths=[log], format_with=lambda facts: called.append(facts) or "{}")
+    data = reporter.file_by_model("нельзя посмотреть логи на странице", "логи на странице настроек",
+                                  "Человек попросил показать логи, колонка ответила, что страницы у неё нет.")
+
+    assert data["status"] == "done" and data["issue_number"] == 1 and "номер 1" in data["say"]
+    assert called == []
+    body = posted[0]["payload"]["body"]
+    assert posted[0]["payload"]["title"] == "колонка: логи на странице настроек"
+    assert "> нельзя посмотреть логи на странице" in body and "страницы у неё нет" in body
+    assert "v0.1.9" in body and "покажи логи" in body and "кольцо кадр" not in body
+
+
+def test_tool_path_refusals_are_data_for_model(tmp_path, posted):
+    assert _reporter(tmp_path, token="").file_by_model("x")["reason"] == "no_token"
+    assert _reporter(tmp_path).file_by_model("  ")["reason"] == "no_complaint"
+    reporter = _reporter(tmp_path)
+    reporter.file_by_model("одно и то же")
+    again = reporter.file_by_model("одно и то же")
+    assert again["status"] == "rejected" and again["reason"] == "cooldown" and "уже отправил" in again["say"]
+    assert len(posted) == 1
