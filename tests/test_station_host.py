@@ -284,3 +284,56 @@ def test_phone_tool_registered_and_dispatches(monkeypatch):
     ok, data, bad = asyncio.run(run())
     assert ok and data["status"] == "done" and bad[0] is False
     assert asked == ["набери Киру"] and spoken == ["Звоню: Кир."]
+
+
+class _Updater:
+    def __init__(self) -> None:
+        self.installed = []
+
+    def latest(self):
+        return "v9.9.9", "Есть новая версия v9.9.9, у меня v0.1.13. Что нового: кольцо."
+
+    def install(self, tag):
+        self.installed.append(tag)
+        return ""  # «не смог скачать» — без перезапуска хоста в тесте
+
+
+class _Live:
+    def __init__(self) -> None:
+        self.said, self._ring = [], None
+
+    def earcon(self):
+        pass
+
+    def speak(self, text, key=""):
+        self.said.append(text)
+
+    async def drain(self):
+        pass
+
+
+def _update(text, updater, monkeypatch):
+    fake = types.ModuleType("station_update")
+    fake.update_command = lambda rest: "check" if "провер" in rest else ("install" if "обнов" in rest else "")
+    monkeypatch.setitem(sys.modules, "station_update", fake)
+    report = types.ModuleType("station_report")
+    report.report_command = lambda rest: ("", "")
+    monkeypatch.setitem(sys.modules, "station_report", report)
+    live = _Live()
+    asyncio.run(sh.code_command(f"{sh.WAKE_WORDS[0]}, {text}", live, updater, None, None, None))
+    return live.said
+
+
+def test_update_news_read_once_per_version(monkeypatch):
+    """Шифу 09.11: «проверь» зачитал, «обновись» — то же самое ещё раз. Сводка по версии — один раз."""
+    updater = _Updater()
+    assert "Что нового" in " ".join(_update("проверь обновление", updater, monkeypatch))
+    said = _update("обновись", updater, monkeypatch)
+    assert not any("Что нового" in s for s in said) and updater.installed == ["v9.9.9"]
+
+
+def test_update_without_check_tells_news_first(monkeypatch):
+    """Сразу «обновись», без проверки, — сначала что нового, потом ставит."""
+    updater = _Updater()
+    said = _update("обновись", updater, monkeypatch)
+    assert "Что нового" in said[0] and updater.installed == ["v9.9.9"]

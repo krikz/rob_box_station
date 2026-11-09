@@ -418,6 +418,8 @@ STATION_STATE = {"volume": int(VOLUME), "mic_muted": False, "started": time.time
 KWS_DIR = Path(os.environ.get("RBX_KWS_DIR", str(BASE / "kws_real")))
 #: Офлайн-фразы (``station_offline``): не в ``assets/`` — их не трогает обновление.
 OFFLINE_DIR = BASE / "offline"
+#: Сводку «что нового» по версии, прочитанную на «проверь», «обновись» в это окно не повторяет.
+UPDATE_TOLD_S = 1800.0
 #: Регистрация Improv в BlueZ дольше этого — без Improv: колонка не должна ждать Bluetooth, чтобы слушать.
 IMPROV_START_S = 10.0
 #: Ход дольше этого — сбой (модель или сеть повисли): колонка говорит, что не смогла, а не молчит.
@@ -921,10 +923,16 @@ async def code_command(text: str, live: "LiveOut", updater, reporter, bt, mic: M
         if live._ring:  # noqa: SLF001
             live._ring.set("think")  # noqa: SLF001  (GitHub отвечает секунды — видно, что колонка занята)
         tag, phrase = await asyncio.to_thread(updater.latest)
-        if command == "check" or not tag:
-            # сводку «что нового» — только на «проверь» (или если ставить нечего: «обновлений нет»)
-            live.speak(phrase + (" Скажи «Игорёк, обновись», чтобы поставить." if tag else ""))
-        # «обновись» — сразу ставить, без второй сводки: 09.11 Шифу «читает то же самое ещё раз, это очень бесит»
+        # Сводку «что нового» по одной версии — один раз (Шифу 09.11: «проверь» зачитал, «обновись» — то же самое
+        # ещё раз, «это очень бесит»). «Проверь» — читает всегда и запоминает; «обновись» без проверки — сначала
+        # расскажет, что ставит; «обновись» после проверки этой же версии — ставит молча.
+        told = getattr(updater, "rbx_told", ("", 0.0))
+        heard_already = bool(tag) and told[0] == tag and time.time() - told[1] < UPDATE_TOLD_S
+        if command == "check" or not tag or not heard_already:
+            live.speak(phrase + (" Скажи «Игорёк, обновись», чтобы поставить." if tag and command == "check"
+                                 else ""))
+            if tag:
+                updater.rbx_told = (tag, time.time())
         done = await asyncio.to_thread(updater.install, tag) if tag and command == "install" else ""
         if tag and command == "install":
             live.speak(done or "Не смог скачать обновление, попробуй позже.")
