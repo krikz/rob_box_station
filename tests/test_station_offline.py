@@ -87,3 +87,13 @@ def test_first_variant_reuses_old_single_file(tmp_path):
 
 def test_every_phrase_has_variants():
     assert all(len(v) >= 2 for v in so.PHRASES.values())
+
+
+def test_last_variant_survives_restart(tmp_path):
+    """09.11: «Я снова тут…» прозвучало два старта подряд — прошлый вариант помнился только в процессе."""
+    calls: list = []
+    cache = so.OfflinePhrases(tmp_path, print, {"hi": ["Привет.", "Здравствуй."]})
+    asyncio.run(cache.refresh(_synth(calls), "V"))
+    first = cache.pick("hi")[0]
+    again = so.OfflinePhrases(tmp_path, print, {"hi": ["Привет.", "Здравствуй."]}).pick("hi")[0]  # «перезапуск»
+    assert first != again
