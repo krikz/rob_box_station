@@ -88,7 +88,9 @@ class OfflinePhrases:
         source = PHRASES if phrases is None else phrases
         #: ключ → список вариантов (строка — один вариант)
         self.phrases: Dict[str, List[str]] = {k: ([v] if isinstance(v, str) else list(v)) for k, v in source.items()}
-        self._last: Dict[str, str] = {}  # ключ → id варианта, сказанного прошлым
+        #: ключ → id варианта, сказанного прошлым; хранится в ``last.json`` — переживает перезапуск хоста
+        #: (09.11 приветствие «Я снова тут…» прозвучало два старта подряд: память жила только в процессе)
+        self._last: Dict[str, str] = self._load_last()
 
     # ------------------------------------------------------------------ варианты
 
@@ -109,7 +111,22 @@ class OfflinePhrases:
         choices = [v for v in ready if v != self._last.get(key)] or ready
         vid = random.choice(choices)
         self._last[key] = vid
+        self._save_last()
         return vid, self.variants()[vid]
+
+    def _load_last(self) -> Dict[str, str]:
+        try:
+            data = json.loads((self.folder / "last.json").read_text(encoding="utf-8"))
+            return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_last(self) -> None:
+        try:
+            if self.folder.is_dir():
+                (self.folder / "last.json").write_text(json.dumps(self._last), encoding="utf-8")
+        except OSError:
+            pass  # не записалось — повтор варианта не беда
 
     def text(self, key: str) -> str:
         """Первый вариант ключа — для лога."""
