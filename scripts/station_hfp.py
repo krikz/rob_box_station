@@ -238,14 +238,15 @@ class CallAudio:
                 self.stop()
 
     def stop(self) -> None:
+        # мягко (SIGTERM): SIGKILL клиента dmix ломает общий микшер — следующий звук колонки висит (09.11)
         if self.up is not None:
             try:
-                self.up.kill()
+                self.up.terminate()
             except OSError:
                 pass
         if self.down is not None:
             try:
-                os.killpg(self.down.pid, signal.SIGKILL)
+                os.killpg(self.down.pid, signal.SIGTERM)
             except (OSError, AttributeError):
                 pass
         self.up = self.down = None
