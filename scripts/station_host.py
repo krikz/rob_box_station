@@ -43,6 +43,10 @@ for sub in ("site", "core", "core/scripts/dialog", "core/scripts/dialogue"):
 for pkg in ("rob_box_core", "rob_box_dialog", "rob_box_harness", "rob_box_llm", "rob_box_voice", "rob_box_mcp_tools"):
     sys.path.insert(0, str(CORE / "src" / pkg))
 
+import station_kws  # noqa: E402  (живые примеры вейка и промахи облака)
+import station_offline  # noqa: E402  (фразы заранее — звучат без сети)
+import station_stt  # noqa: E402  (STT: MiniMax → Яндекс, хедж)
+
 RATE = 16000
 FRAME_S = 0.03
 FRAME_IN = int(RATE * FRAME_S) * 2  # байт кадра 30 мс, 16 кГц моно
@@ -59,10 +63,6 @@ WAKE_WORDS = [w.strip() for w in os.environ.get(
     "RBX_WAKE", ",".join(WAKE_DEFAULT)).split(",") if w.strip()]
 START_FRAMES, END_SILENCE_S, MIN_S, MAX_S = 5, 0.8, 0.7, 12.0
 TTS_FORMAT, TTS_RATE = "pcm_24000", 24000
-#: 429 от MiniMax STT: провайдер режет одновременные запросы (08.11: две колонки на одном ключе).
-#: Повтор с паузой дешевле молчания — 20 с паузы хост делает только если все попытки отбились.
-STT_429_TRIES = int(os.environ.get("RBX_STT_429_TRIES", "3"))
-STT_429_PAUSE = float(os.environ.get("RBX_STT_429_PAUSE", "0.6"))
 #: Потоковый синтез (SSE MiniMax): звук играет с первого куска, а не после всей фразы. 0 — целым куском (сравнение).
 TTS_STREAM = os.environ.get("RBX_TTS_STREAM", "1") != "0"
 #: Запас звука перед стартом ``aplay`` в потоке: куски SSE приходят неровно, без запаса речь рвётся.
@@ -108,6 +108,8 @@ class Mic:
         self.state = None
         self.muted = False
         self.user_muted = False  # кнопка «микрофон выкл»: кадры не идут в VAD, пока не включат
+        #: Звонок по телефону: кадры уходят собеседнику, а не в VAD (вейк в разговоре не слушаем).
+        self.tap = None
         self.q: "queue.Queue[bytes]" = queue.Queue(maxsize=int(30 / FRAME_S))  # 30 с запаса
         threading.Thread(target=self._pump, daemon=True).start()
 
@@ -123,6 +125,10 @@ class Mic:
     def _pump(self) -> None:
         while True:
             fr = self._read()
+            tap = self.tap
+            if tap is not None:
+                tap(fr)
+                continue
             if self.muted or self.user_muted:
                 continue
             try:
@@ -192,19 +198,39 @@ class _NoAudioYet(Exception):
 
 
 class Voice:
-    """STT и TTS MiniMax (ключи из ``scripts/dialogue/.env``)."""
+    """STT — цепочка провайдеров (``station_stt``: MiniMax → Яндекс), TTS — MiniMax (ключи ``scripts/dialogue/.env``)."""
 
     def __init__(self) -> None:
         from rob_box_llm.providers.minimax_tts import MiniMaxTTSProvider  # noqa: PLC0415
-        from rob_box_voice.stt_providers.minimax_provider import MiniMaxSTTProvider  # noqa: PLC0415
 
         self.tts = MiniMaxTTSProvider()
-        self.stt = MiniMaxSTTProvider.maybe_from_env()
-        if self.stt is None:
-            raise SystemExit("нет MINIMAX_API_KEY для STT")
+        self.stt = station_stt.SttChain.from_env()
+        if not self.stt.providers:
+            raise SystemExit("нет ключа STT (MINIMAX_API_KEY или YANDEX_API_KEY)")
+        log(f"STT: {' → '.join(self.stt.names())}, хедж {self.stt.hedge_s:.1f} с")
         self.limited = False
         self.proc: subprocess.Popen | None = None  # текущий aplay речи — его глушит кнопка
         self.cut = False
+
+    async def synth_pcm(self, text: str, voice: str | None = None) -> bytes:
+        """Синтез целиком в PCM 24 кГц (офлайн-фразы заранее)."""
+        return await self.tts.synthesize_bytes(text, voice or None, format=TTS_FORMAT)
+
+    async def play_pcm(self, pcm: bytes, mic: Mic | None = None, on_sound=None) -> None:
+        """Готовый звук (офлайн-фраза, тон) в динамик, микрофон заглушён на время — свой звук не уходит в STT."""
+        self.cut = False
+        if mic:
+            mic.muted = True
+        try:
+            if on_sound:
+                on_sound()
+            self.proc = subprocess.Popen(aplay_cmd(), stdin=subprocess.PIPE)
+            await asyncio.to_thread(self.proc.communicate, pcm)
+        finally:
+            if mic:
+                await asyncio.sleep(0.3)
+                mic.flush()
+                mic.muted = False
 
     def stop(self) -> None:
         """Кнопка: оборвать текущую реплику (aplay убить, поток синтеза бросить)."""
@@ -298,30 +324,16 @@ class Voice:
         return first
 
     def stt_limited(self) -> bool:
-        """Последний отказ STT — лимит провайдера (429): без паузы шум съест квоту."""
+        """Последний отказ STT — лимит всех провайдеров (429): без паузы шум съест квоту."""
         return self.limited
 
-    def hear(self, pcm: bytes) -> str:
-        from rob_box_voice.stt_providers.minimax_provider import (  # noqa: PLC0415
-            MiniMaxSTTError, MiniMaxSTTRateLimitError)
-
-        self.limited = False
-        wav = wav_bytes(pcm)
-        for attempt in range(STT_429_TRIES):
-            try:
-                return (self.stt.transcribe(wav).text or "").strip()
-            except MiniMaxSTTRateLimitError:
-                # 429 у MiniMax транзиентный: 08.11 две колонки на одном ключе по очереди получали отказ.
-                # Переждать дешевле, чем молчать 20 с: пауза растёт 0,6 -> 1,2 с.
-                if attempt + 1 >= STT_429_TRIES:
-                    self.limited = True
-                    break
-                log(f"STT 429 — повтор {attempt + 2}/{STT_429_TRIES}")
-                time.sleep(STT_429_PAUSE * (attempt + 1))
-            except MiniMaxSTTError as exc:
-                log(f"STT ошибка: {type(exc).__name__}")
-                break
-        return ""
+    def hear(self, pcm: bytes) -> "station_stt.Heard":
+        """Распознать фразу цепочкой; отказ — ``Heard.error`` (а не пустой текст: тишина и сбой — разные вещи)."""
+        heard = self.stt.hear(pcm)
+        self.limited = heard.error == "limited"
+        for note in heard.notes:
+            log(f"STT {note}")
+        return heard
 
 
 def load_env() -> None:
@@ -352,8 +364,8 @@ async def selftest(voice: Voice, phrase: str) -> None:
     pcm = b"".join(frames)
     log(f"синтез {synth:.2f} с; записано {len(pcm) / 2 / RATE:.1f} с, RMS {audioop.rms(pcm, 2)}")
     t0 = time.time()
-    text = voice.hear(pcm)
-    log(f"STT за {time.time() - t0:.2f} с: «{text}»")
+    heard = voice.hear(pcm)
+    log(f"STT {heard.provider or heard.error} за {time.time() - t0:.2f} с: «{heard.text}»")
 
 
 def install_llm_hedge(hedge_s: float = HEDGE_S) -> None:
@@ -401,10 +413,17 @@ def install_llm_hedge(hedge_s: float = HEDGE_S) -> None:
 STATION_STATE = {"volume": int(VOLUME), "mic_muted": False, "started": time.time()}
 
 
-#: Живые примеры для модели ключевых слов (``training/kws``): ``pos`` — первая секунда обращения с вейком в начале,
-#: ``neg`` — секунда из фразы без вейка. Потолок — место на ``/data`` (колонка, 35 МБ свободно); ``/tmp`` — в ОЗУ.
+#: Живые примеры для модели ключевых слов (``training/kws``): ``pos`` / ``neg`` / ``miss`` — ``station_kws``.
+#: Каталог на ``/data`` (``/tmp`` — в ОЗУ).
 KWS_DIR = Path(os.environ.get("RBX_KWS_DIR", str(BASE / "kws_real")))
-KWS_CAP_BYTES = int(os.environ.get("RBX_KWS_CAP_MB", "10")) * 2**20
+#: Офлайн-фразы (``station_offline``): не в ``assets/`` — их не трогает обновление.
+OFFLINE_DIR = BASE / "offline"
+#: Сводку «что нового» по версии, прочитанную на «проверь», «обновись» в это окно не повторяет.
+UPDATE_TOLD_S = 1800.0
+#: Регистрация Improv в BlueZ дольше этого — без Improv: колонка не должна ждать Bluetooth, чтобы слушать.
+IMPROV_START_S = 10.0
+#: Ход дольше этого — сбой (модель или сеть повисли): колонка говорит, что не смогла, а не молчит.
+TURN_TIMEOUT_S = float(os.environ.get("RBX_TURN_TIMEOUT_S", "45"))
 
 
 #: Своя модель ключевых слов (``training/kws``, программа на C ``kws_run``). Пока режим тени: считает каждую фразу
@@ -415,8 +434,6 @@ KWS_MODEL = BASE / "kws" / "kws_model.bin"
 #: можно включить в ``.env`` (страница его не перетирает) или в ``settings.json`` и перезапустить хост.
 #: Порог — ``RBX_KWS_THRESHOLD`` (дефолт 0,8; на живых замерах 0,6 даёт recall 90,2 % при ложных 0,8 %).
 KWS_WAKE_LABEL = "igorek"
-#: Что сказать, если модель услышала вейк, а облако текст не разобрало.
-KWS_HEARD_PHRASE = "Слушаю."
 
 
 def kws_score(pcm: bytes) -> tuple:
@@ -458,25 +475,65 @@ def kws_wake_text(text: str, label: str, prob: float) -> str:
     return f"{WAKE_WORDS[0]}, {text}"
 
 
-def kws_collect(pcm: bytes, text: str) -> None:
-    """Сохранить секунду фразы как живой пример (вейк в начале — ``pos``, без вейка — ``neg``); полно — молча мимо."""
-    words = [w.strip(",.!?") for w in text.lower().split()]
-    if not words:
-        return
-    kind = "pos" if words[0] in WAKE_WORDS else ("neg" if not set(words) & set(WAKE_WORDS) else "")
-    if not kind:
-        return  # вейк в середине — где он, без меток времени STT не знаем
+#: Своя модель уверена, что звучало имя, — кольцо «думаю» сразу после фразы, до ответа облака (0,4 с против 2–3 с):
+#: человек видит, что его услышали. Решения это не меняет — только показ.
+KWS_EARLY_P = float(os.environ.get("RBX_KWS_EARLY_P", "0.6"))
+#: Облако текста не дало, а модель слышит имя с такой уверенностью — «Слушаю.» и окно без вейка, даже в режиме тени.
+KWS_HEARD_P = float(os.environ.get("RBX_KWS_HEARD_P", "0.95"))
+#: …и только на фразу не длиннее (голое «Игорёк» — 1–2 с; 12 с — это шум или телевизор).
+KWS_HEARD_MAX_S = float(os.environ.get("RBX_KWS_HEARD_MAX_S", "3"))
+
+
+def _lev(a: str, b: str) -> int:
+    """Расстояние правки (слова короткие — квадрат не страшен)."""
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def wake_fix(text: str, label: str = "", prob: float = 0.0) -> str:
+    """Имя, искажённое облаком, — всё равно имя: «Горек, который час» → «Игорёк, который час» (решает код, ADR-0148).
+
+    Первое слово (или два первых слитно: «и горек», «игорь ок») ближе к форме вейка, чем на 1 правку, — вейк;
+    своя модель слышит «Игорька» (≥ 0,5) — допуск 2. Иначе — как раньше: вейк по модели в режиме «решает модель».
+    09.11 Шифу: «приходится по многу раз звать Игорька» — каждое искажение облака было промахом.
+    """
+    words = text.split()
+    if not words or station_kws.wake_position(text, WAKE_WORDS) in ("start", "inside"):
+        return text
+    clean = [w.strip(",.!?;:«»\"'—–-").lower().replace("ё", "е") for w in words[:2]]
+    kws_yes = label == KWS_WAKE_LABEL and prob >= station_kws.MISS_KWS_P
+    forms = {w.replace("ё", "е") for w in WAKE_WORDS}
+    for n, cand in ((1, clean[0]), (2, "".join(clean))):
+        if n > len(clean) or len(cand) < 5:
+            continue
+        dist = min(_lev(cand, w) for w in forms)
+        if dist <= (2 if kws_yes else 1) and not (n == 2 and dist > 0 and not kws_yes):
+            log(f"🔑 вейк по созвучию: «{' '.join(words[:n])}» (правок {dist}"
+                + (f", kws {label} {prob:.2f}" if label else "") + f") → «{WAKE_WORDS[0]}»")
+            return f"{WAKE_WORDS[0]}, " + " ".join(words[n:])
+    return kws_wake_text(text, label, prob)
+
+
+def net_ok(host: str = "api.minimax.io", timeout: float = 1.5) -> bool:
+    """Есть ли сеть: адрес Wi-Fi и DNS отвечает. Зовётся только при сбое — выбрать фразу «нет интернета»."""
+    if not wifi_now()["ip"]:
+        return False
+    import concurrent.futures as cf  # noqa: PLC0415
+    import socket  # noqa: PLC0415
+
+    pool = cf.ThreadPoolExecutor(max_workers=1)
     try:
-        used = sum(f.stat().st_size for f in KWS_DIR.rglob("*.wav")) if KWS_DIR.exists() else 0
-        if used > KWS_CAP_BYTES:
-            return
-        sec = RATE * 2
-        start = 0 if kind == "pos" else max(0, (len(pcm) - sec) // 2 // 2 * 2)
-        chunk = pcm[start:start + int(sec * 1.2)]
-        (KWS_DIR / kind).mkdir(parents=True, exist_ok=True)
-        (KWS_DIR / kind / f"real__{int(time.time() * 1000)}.wav").write_bytes(wav_bytes(chunk))
-    except OSError as exc:
-        log(f"kws: пример не сохранён: {exc}")
+        pool.submit(socket.getaddrinfo, host, 443).result(timeout=timeout)
+        return True
+    except (cf.TimeoutError, OSError):
+        return False
+    finally:
+        pool.shutdown(wait=False)
 
 
 def save_setting(name: str, value: str) -> None:
@@ -510,7 +567,46 @@ def device_facts() -> str:
     return (f"- Wi-Fi network: {net['ssid'] or 'none'}; IP address: {net['ip'] or 'none'}.\n"
             f"- Settings page (keys, prompt, Wi-Fi, voice): {page}. Saving needs the Alice button press first.\n"
             "- Say an IP address by its number groups, as people read it aloud (10.1.1.13 → «десять, один, один, "
-            "тринадцать»).")
+            "тринадцать»).\n"
+            "- Your code (not you) handles these phrases; if asked, tell the person the exact words: «Игорёк, проверь "
+            "обновление» (tells what is new), «Игорёк, обновись» (installs it), «Игорёк, включи блютуз» (music from a "
+            "phone).\n"
+            "- Complaints and bug reports for your developers: you CAN file them yourself with the `report_issue` tool "
+            "(a GitHub issue with your log). Use it when the person asks to complain, report a bug or pass something "
+            "to the developers — never say you cannot. Never use it on your own initiative.\n"
+            "- Phone calls go through the person's phone by Bluetooth: use the `phone_call` tool (dial / answer / "
+            "hangup). Never say «звоню» or «набираю» without calling it — 09.11 you said «Звоню Киру» and nothing "
+            "was dialled. The code announces who it dials; you add nothing after the tool.\n"
+            + JOKE_RULES)
+
+
+#: Анекдоты (Шифу 09.11: «Игорёк рассказывает не смешные анекдоты»). Живут в коде, а не в промпте колонки: промпт
+#: Шифу правит на странице, а это правило должно доехать обновлением. Характер зануды из дополнения тянул
+#: «уточню формулировку» сразу после концовки — шутка умирала.
+JOKE_RULES = (
+    "- JOKES («расскажи анекдот», «пошути»): tell ONE real, well-known Russian anekdot that people actually laugh at "
+    "(Штирлиц, Вовочка, Петька и Василий Иванович, Рабинович, программисты, работа, семья, врачи) — not a pun you "
+    "invent on the spot and not a children's riddle. Keep it short: setup in 1–3 sentences, dialogue with dashes, "
+    "«…» right before the punchline, and the punchline is the LAST words you say. Never explain the joke, never "
+    "add a moral, a clarification or your character's remark after the punchline (one short line before the joke "
+    "is fine). «Ещё» — a different joke on a different theme; never repeat one told in this conversation. A topic "
+    "named — a joke on that topic. No jokes about nationality, disability or illness of real people; adult jokes "
+    "only when asked. Never change the punchline of a known joke and never make up a new «Штирлиц…» ending: if you "
+    "do not remember a joke word for word, tell one you do. The level to aim for (folk classics — tell these or "
+    "others just as famous; 09.11 «tell other ones» made the model invent unfunny endings, so these are allowed):\n"
+    "  «Штирлиц выстрелил в упор. Упор упал.»\n"
+    "  «Штирлиц долго смотрел в одну точку. Потом в другую. «Двоеточие!» — догадался Штирлиц.»\n"
+    "  «— Вовочка, назови два местоимения. — Кто, я? — Правильно.»\n"
+    "  «— Петька, приборы! — Двести! — Что «двести»? — А что «приборы»?»\n"
+    "  «Программист ставит на ночь у кровати два стакана: с водой — если захочет пить, и пустой — если не "
+    "захочет.»\n"
+    "  «— Доктор, меня все игнорируют. — Следующий!»\n"
+    "  «— Доктор, у меня всё болит: куда ни нажму — везде больно. — У вас, батенька, палец сломан.»\n"
+    "  «Кошка сидит у норки и лает. Мышь думает: собака, значит, кошки нет, — и вылезла. Кошка её хвать: "
+    "«Вот что значит знать иностранные языки!»»\n"
+    "  «— Алло, это прачечная? — Хреначечная! Это Министерство культуры!»\n"
+    "  «— Василий Иванович, а ты армией командовать можешь? — Могу, Петька. — А фронтом? — Могу. — А всем "
+    "миром? — Нет, Петька, языков не знаю.»")
 
 
 class _LogNode:
@@ -623,6 +719,124 @@ def install_station_tools(stand) -> None:
         setattr(tools, f"_t_{name}", unavailable(what))
 
 
+REPORT_TOOL = "report_issue"
+REPORT_TOOL_DESCRIPTION = (
+    "File a complaint or bug report about this speaker as a GitHub issue for its developers; the speaker's version, "
+    "settings and recent log are attached automatically. Call it ONLY when the person explicitly asks to complain, "
+    "report a bug or pass something to the developers («пожалуйся», «заведи баг», «передай разработчикам»). "
+    "After the result, say its `say` field (or tell the issue number) in your own words, briefly.")
+REPORT_TOOL_PARAMETERS = {
+    "type": "object",
+    "properties": {
+        "complaint": {"type": "string", "description": "The person's complaint in their own words, verbatim "
+                      "(Russian), without the wake word and without «пожалуйся»."},
+        "title": {"type": "string", "description": "Short issue title in Russian, up to 70 characters."},
+        "details": {"type": "string", "description": "What happened, from this conversation: what the person "
+                    "asked, what you answered or failed to do. Facts only, 1-4 sentences, Russian. No guesses "
+                    "about the cause."},
+        "with_log": {"type": "boolean", "description": "Attach recent log lines (default true; false if the "
+                     "person said «без лога»)."},
+    },
+    "required": ["complaint"],
+}
+
+
+def register_tool(name: str, description: str, parameters: dict) -> bool:
+    """Дописать тул модели в каталог ядра при старте (каталог неизменяемый — ``MappingProxyType``): запись,
+    класс ``query`` и «виден всегда». Повторный вызов — ничего не делает."""
+    from types import MappingProxyType  # noqa: PLC0415
+
+    try:
+        from rob_box_core import tool_catalog as tc  # noqa: PLC0415
+        from rob_box_dialog import knowledge as kn  # noqa: PLC0415
+    except ImportError as exc:
+        log(f"🧰 тул {name} не поставлен: {exc}")
+        return False
+    if name not in tc._BY_NAME:  # noqa: SLF001
+        entry = tc.ToolCatalogEntry(name=name, description=description, parameters=MappingProxyType(dict(parameters)),
+                                    read_only=False, destructive=False, idempotent=False, skill=(tc.CORE_SKILL,))
+        tc.TOOL_CATALOG = tc.TOOL_CATALOG + (entry,)
+        tc._BY_NAME = MappingProxyType({**tc._BY_NAME, name: entry})  # noqa: SLF001
+        kn.TOOL_CLASSES = MappingProxyType({**kn.TOOL_CLASSES, name: "query"})
+        kn.TOOLS_ALWAYS = tuple(kn.TOOLS_ALWAYS) + (name,)
+    return True
+
+
+PHONE_TOOL = "phone_call"
+PHONE_TOOL_DESCRIPTION = (
+    "Place, answer or end a phone call through the person's phone connected to you by Bluetooth. Call it whenever "
+    "the person asks to call someone («позвони Киру», «набери маму», a number), to answer («прими») or to hang up "
+    "(«сбрось»). NEVER say you are calling without calling this tool. Your code finds the contact and announces "
+    "the result itself (who it dials, or that it found several) — after the tool say nothing or one short word.")
+PHONE_TOOL_PARAMETERS = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": ["dial", "answer", "hangup"]},
+        "who": {"type": "string", "description": "Contact name as the person said it (Russian), or a phone number. "
+                "Only for dial."},
+    },
+    "required": ["action"],
+}
+
+
+def install_phone_tool(stand, hfp, live: "LiveOut") -> None:
+    """Обработчик ``phone_call``: AT-команды идут в фоне (тул синхронный), фразу итога говорит код."""
+    def call(args: dict) -> tuple:
+        action = str(args.get("action") or "")
+        who = str(args.get("who") or "").strip()
+        if hfp is None:
+            return False, {"status": "rejected", "reason": "unavailable", "detail": "звонки выключены (RBX_HFP=0)"}
+        phrase = {"dial": f"набери {who}", "answer": "прими", "hangup": "сбрось"}.get(action, "")
+        if not phrase or (action == "dial" and not who):
+            return False, {"status": "rejected", "reason": "bad_args", "detail": "кому звонить?"}
+        log(f"📞 тул {PHONE_TOOL}: {action} «{who}»")
+
+        async def run() -> None:
+            reply = await hfp.handle(phrase)
+            if reply:
+                live.speak(reply)
+
+        asyncio.ensure_future(run())
+        return True, {"status": "done", "note": "колонка набирает и сама скажет, кому звонит"}
+
+    stand.tools._t_phone_call = call
+
+
+def register_report_tool() -> bool:
+    """Тул модели ``report_issue`` (Шифу 09.11: «код не всегда подхватывает, а модель тупит и говорит, что не может
+    жалобу создать — надо дать инструмент модели»).
+
+    Каталог тулов ядра неизменяемый (``MappingProxyType``), поэтому хост дописывает запись при старте: каталог,
+    класс ``query`` (данные — обратно модели, фразу строит она; ждут 15 с — второго вызова LLM нет) и «виден всегда»
+    (``TOOLS_ALWAYS``). Таблицы читаются через модуль (``kn.X``, ``tc._BY_NAME``) — подмена атрибута доходит.
+    Разбор фразы кодом («пожалуйся, что…») остаётся первым: он быстрее и не зависит от модели.
+    TODO: место тулу — ядро колонки (ADR-0167), когда ядро станет пакетом.
+    """
+    return register_tool(REPORT_TOOL, REPORT_TOOL_DESCRIPTION, REPORT_TOOL_PARAMETERS)
+
+
+def install_report_tool(stand, reporter) -> bool:
+    """Обработчик ``report_issue`` в исполнителе стенда (каталог — :func:`register_report_tool`, до сборки стенда)."""
+    if not register_report_tool():
+        return False
+
+    def report(args: dict) -> tuple:
+        complaint = str(args.get("complaint") or "").strip()
+        log(f"📮 тул {REPORT_TOOL}: «{complaint}»")
+        live = getattr(stand, "rbx_live", None)
+        if live is not None:
+            live.earcon()  # ход ждёт GitHub пару секунд — щелчок, что дело пошло
+        if os.environ.get("RBX_REPORT_DRY") == "1":  # проверка без записи в GitHub
+            return True, {"status": "done", "issue_number": 0, "say": "Проверка: issue не заведён (RBX_REPORT_DRY)."}
+        data = reporter.file_by_model(complaint, str(args.get("title") or ""), str(args.get("details") or ""),
+                                      args.get("with_log") is not False)
+        return data["status"] == "done", data
+
+    stand.tools._t_report_issue = report
+    log(f"📮 тул модели {REPORT_TOOL} поставлен")
+    return True
+
+
 def make_stand(args: argparse.Namespace):
     import chat  # noqa: PLC0415
 
@@ -634,10 +848,18 @@ def make_stand(args: argparse.Namespace):
     log(f"промпт: основа {'своя' if prompts.is_own() else 'ядра'}"
         f"{', дополнение ' + str(len(prompts.extra().strip())) + ' знаков' if prompts.extra().strip() else ''}")
     t0 = time.time()
+    register_report_tool()  # до сборки стенда: срез тулов не должен успеть закэшироваться без него
+    if os.environ.get("RBX_HFP", "1").strip().lower() not in ("0", "off", "false", "no"):
+        register_tool(PHONE_TOOL, PHONE_TOOL_DESCRIPTION, PHONE_TOOL_PARAMETERS)
     cargs = chat.build_arg_parser().parse_args(["--wake-word"] + (["--db", args.db] if args.db else []))
     stand = chat.build_stand(cargs, Path(args.workdir))
     stand.wake = list(WAKE_WORDS)  # таблица вейков робота (wake_words.yaml) колонке не подходит
     install_station_tools(stand)
+    import station_report  # noqa: PLC0415  (жалоба в GitHub: «пожалуйся» → issue с логом)
+
+    stand.rbx_reporter = station_report.Reporter(BASE, lambda: os.environ.get("GH_ISSUE_TOKEN", ""), log,
+                                                 format_with=station_report.deepseek_formatter(log))
+    install_report_tool(stand, stand.rbx_reporter)
     log(f"ядро готово за {time.time() - t0:.1f} с (вейк: {', '.join(WAKE_WORDS)})")
     return chat, stand
 
@@ -657,9 +879,144 @@ async def one_turn(voice: Voice, args: argparse.Namespace) -> None:
         stand.close()
 
 
+async def first_heard(chain_task: asyncio.Future, sprint_task: asyncio.Future):
+    """Гонка цепочки STT и быстрого запасного: первый удачный ответ; отказ одного — ждём другого."""
+    pending = {chain_task, sprint_task}
+    last = None
+    while pending:
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            last = task.result()
+            if last.ok:
+                for other in pending:  # проигравший досчитает в своём потоке, результат не нужен
+                    other.add_done_callback(lambda t: t.exception())
+                if task is sprint_task:  # заметки цепочки уже в логе (Voice.hear), у гонщика — свои
+                    log(f"STT гонка: первым {last.provider} ({last.seconds:.2f} с)")
+                return last
+    return last
+
+
+def without_wake(text: str) -> "str | None":
+    """Фраза без имени колонки, если имя в ней есть (в начале, в конце или в середине); нет имени — ``None``.
+
+    09.11: «Набери Кир, Игорёк» (имя в конце) ушло модели, и та ответила «Звоню Киру», ничего не набрав.
+    """
+    words = text.split()
+    keep = [w for w in words if w.lower().strip(",.!?;:«»") not in WAKE_WORDS]
+    if len(keep) == len(words):
+        return None
+    return " ".join(keep).strip(" ,.!?;:")
+
+
+async def code_command(text: str, live: "LiveOut", updater, reporter, bt, mic: Mic, hfp=None) -> bool:
+    """Команды, которые решает код (ADR-0148), — после вейка: обновление, жалоба, звонок, Bluetooth.
+    Выполнил — ``True``."""
+    import station_report  # noqa: PLC0415
+    import station_update  # noqa: PLC0415
+
+    rest = without_wake(text)
+    if rest is None:
+        return False
+    command = station_update.update_command(rest)
+    if command:  # обновление: «проверь» — только рассказать, «обновись» — поставить
+        live.earcon()
+        if live._ring:  # noqa: SLF001
+            live._ring.set("think")  # noqa: SLF001  (GitHub отвечает секунды — видно, что колонка занята)
+        tag, phrase = await asyncio.to_thread(updater.latest)
+        # Сводку «что нового» по одной версии — один раз (Шифу 09.11: «проверь» зачитал, «обновись» — то же самое
+        # ещё раз, «это очень бесит»). «Проверь» — читает всегда и запоминает; «обновись» без проверки — сначала
+        # расскажет, что ставит; «обновись» после проверки этой же версии — ставит молча.
+        told = getattr(updater, "rbx_told", ("", 0.0))
+        heard_already = bool(tag) and told[0] == tag and time.time() - told[1] < UPDATE_TOLD_S
+        if command == "check" or not tag or not heard_already:
+            live.speak(phrase + (" Скажи «Игорёк, обновись», чтобы поставить." if tag and command == "check"
+                                 else ""))
+            if tag:
+                updater.rbx_told = (tag, time.time())
+        done = await asyncio.to_thread(updater.install, tag) if tag and command == "install" else ""
+        if tag and command == "install":
+            live.speak(done or "Не смог скачать обновление, попробуй позже.")
+        await live.drain()
+        if done.startswith("Обновляюсь"):
+            updater.arm_watchdog()  # окно сторожа начинается здесь: озвучка уже позади (08.11: откат)
+            restart_self(mic, "обновление", announce=False)
+        return True
+    action, complaint = station_report.report_command(rest)
+    if action:  # жалоба по фразе: быстрее и надёжнее модели; иначе — тул модели report_issue
+        live.earcon()
+        if live._ring:  # noqa: SLF001
+            live._ring.set("think")  # noqa: SLF001
+        live.speak(await asyncio.to_thread(reporter.file, complaint, action == "file"))
+        await live.drain()
+        return True
+    if hfp is not None:
+        reply = await hfp.handle(rest)
+        if reply is not None:  # звонок: «набери Кира», «прими», «сбрось» — AT-команды телефону
+            live.earcon()
+            if reply:
+                live.speak(reply)
+            await live.drain()
+            return True
+    reply = await bt.handle(rest)
+    if reply:  # Bluetooth-музыка: ход модели не нужен
+        live.earcon()
+        live.speak(reply)
+        await live.drain()
+        return True
+    return False
+
+
+async def start_hfp(live: "LiveOut", mic: Mic, ring: "Ring"):
+    """Звонки через телефон (``station_hfp``, #16): ``RBX_HFP=0`` — выключить (bluealsa остаётся как у Алисы)."""
+    if os.environ.get("RBX_HFP", "1").strip().lower() in ("0", "off", "false", "no"):
+        return None
+    import station_hfp  # noqa: PLC0415
+
+    def on_ring(who: str) -> None:
+        live.tone("ok")
+        live.speak(f"Звонит {who}. Скажи «Игорёк, прими» или нажми кнопку сверху.")
+
+    def on_call(up: bool) -> None:
+        if up:
+            live.stop()  # своя речь в разговор не лезет
+            # со звуком через колонку микрофон уходит в звонок; без звука — колонка слушает дальше («Игорёк, сбрось»)
+            mic.tap = hfp.audio.feed if hfp.audio and station_hfp.CALL_AUDIO else None
+            ring.set("call")
+        else:
+            mic.tap = None
+            mic.flush()
+            ring.idle()
+            live.tone("ok")
+
+    hfp = station_hfp.Hfp(log, on_ring, on_call)
+    await asyncio.to_thread(station_hfp.Hfp.ensure_profile, log)
+    asyncio.ensure_future(hfp.keep_attached())
+    return hfp
+
+
+def announce_start(live: "LiveOut", version: str) -> None:
+    """Голосом сказать, что колонка поднялась (#15: «когда стартуешь, ничего не говоришь, непонятно, запустился ли»).
+
+    Новая версия — «Обновился до …» (синтезом: версия меняется, заранее её не запишешь), иначе офлайн-фраза.
+    """
+    mark = BASE / "announced_version"
+    live.begin(time.time())  # отсчёт задержки — от старта, а не от нуля эпохи
+    try:
+        before = mark.read_text(encoding="utf-8").strip()
+    except OSError:
+        before = ""
+    if before and version and before != version:
+        live.speak(f"Обновился до версии {version}. Слушаю.")
+    else:
+        live.say_offline("started")
+    try:
+        mark.write_text(version, encoding="utf-8")
+    except OSError:
+        pass
+
+
 async def serve(voice: Voice, args: argparse.Namespace) -> None:
     import station_bt  # noqa: PLC0415  (Bluetooth-музыка: сопряжение и пульт плеера телефона)
-    import station_report  # noqa: PLC0415  (жалоба в GitHub: «пожалуйся» → issue с логом)
     import station_update  # noqa: PLC0415  (обновление колонки с GitHub по тегу)
 
     chat, stand = make_stand(args)
@@ -670,75 +1027,100 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
     live = LiveOut(stand, voice, mic, ring)
     buttons = Buttons(mic, ring, live)
     bt = station_bt.BtMedia(log)
+    asyncio.ensure_future(bt.ensure_alias())  # имя для телефонов слетает с перезагрузкой
+
+    def on_bt(name: str, up: bool) -> None:
+        """Телефон подключился — перезвон и «Телефон подключён»; отключился — две ноты вниз и «отключён»."""
+        live.tone("connect" if up else "disconnect")
+        live.say_offline("bt_on" if up else "bt_off")
+
     updater = station_update.Updater(BASE, lambda: os.environ.get("GITHUB_TOKEN", ""), log)
-    reporter = station_report.Reporter(BASE, lambda: os.environ.get("GH_ISSUE_TOKEN", ""), log,
-                                       format_with=station_report.deepseek_formatter(log))
+    reporter = stand.rbx_reporter
+    kws = station_kws.KwsCollector(KWS_DIR, log)
     asyncio.get_running_loop().call_later(30, station_update.OK_MARK.touch)  # «здоров» — сторож отката не нужен
-    log(f"версия колонки: {updater.current()}")
+    version = updater.current()
+    log(f"версия колонки: {version}")
+    try:
+        await bt.watch_connections(on_bt)
+    except Exception as exc:  # noqa: BLE001 — без BlueZ колонка работает и так
+        log(f"🎵 Bluetooth: не слежу за подключениями: {type(exc).__name__}: {exc}")
+    hfp = await start_hfp(live, mic, ring)
+    buttons.hfp = hfp
+    install_phone_tool(stand, hfp, live)
     Keys(asyncio.get_running_loop(), buttons.on_key)
     await start_setup(stand, mic, ring, buttons)
+    announce_start(live, version)
+    live.refresh_offline(delay=8.0)  # пока сеть есть — досинтезировать фразы на случай, когда её не будет
     try:
         while True:
             pcm = await asyncio.to_thread(vad.utterance, mic)
             t1 = time.time()
-            kws_task = asyncio.ensure_future(asyncio.to_thread(kws_score, pcm))  # тень: параллельно с облаком
-            text = await asyncio.to_thread(voice.hear, pcm)
-            t2 = time.time()
-            label, prob = await kws_task
-            log(f"🎤 {len(pcm) / 2 / RATE:.1f} с → STT {t2 - t1:.2f} с: «{text}»"
-                + (f"  🔑 kws {label} {prob:.2f}" if label else ""))
-            kws_collect(pcm, text)
-            if not text:
-                if voice.stt_limited():
-                    log("STT 429 — пауза 20 с")
-                    await asyncio.sleep(20)
-                    mic.flush()
-                elif kws_wake(label, prob):
-                    # облако текст не дало, но своя модель услышала вейк — отвечаем коротко, чтобы человек не гадал
-                    live.begin(t1)
-                    live.earcon()
-                    live.speak(KWS_HEARD_PHRASE)
-                    await live.drain()
-                    mic.flush()
-                continue
-            text = buttons.address(kws_wake_text(text, label, prob))
             live.begin(t1)
-            words = text.split()
-            if words and words[0].lower().strip(",.!?") in WAKE_WORDS:
-                command = station_update.update_command(" ".join(words[1:]))
-                if command:  # обновление: решает код; «проверь» — только рассказать, «обновись» — поставить
+            stt_task = asyncio.ensure_future(asyncio.to_thread(voice.hear, pcm))
+            label, prob = await asyncio.to_thread(kws_score, pcm)  # 0,4 с — раньше облака
+            early = label == KWS_WAKE_LABEL and prob >= KWS_EARLY_P
+            if early and ring.state in ("off", "listen"):
+                ring.set("think")  # своя модель слышит имя: показать сразу, а не через 2–3 с облака
+            sprint = voice.stt.sprinter() if (early or buttons.armed()) and not stt_task.done() else ""
+            heard = await first_heard(stt_task, asyncio.ensure_future(
+                asyncio.to_thread(voice.stt.hear_one, sprint, pcm))) if sprint else await stt_task
+            text, t2 = heard.text, time.time()
+            log(f"🎤 {len(pcm) / 2 / RATE:.1f} с → STT {heard.provider or heard.error} {t2 - t1:.2f} с: «{text}»"
+                + (f"  🔑 kws {label} {prob:.2f}" if label else ""))
+            armed = buttons.armed()
+            if not heard.ok:  # сбой облака — не тишина: если звали колонку, сказать, что не так
+                if early or armed or kws_wake(label, prob):
+                    key = {"limited": "stt_limited"}.get(heard.error) or (
+                        "stt_fail" if await asyncio.to_thread(net_ok) else "no_net")
+                    await live.trouble(key)
+                else:
+                    ring.idle() if ring.state == "think" else None
+                if heard.error == "limited":
+                    await asyncio.sleep(3)  # все провайдеры в лимите — переждать, а не жечь квоту шумом
+                mic.flush()
+                continue
+            kws.observe(pcm, text, WAKE_WORDS, label, prob, heard.provider, now=t1)
+            if not text:
+                # облако текста не дало, а своя модель слышит голое имя — коротко ответить и ждать фразу без вейка.
+                # Только на короткую фразу и не внутри уже открытого окна: 09.11 шум 12 с дал «igorek 0.97» →
+                # «Слушаю», а эхо этого «Слушаю» в открытом окне — снова «Слушаю», и так по кругу
+                short = len(pcm) / 2 / RATE <= KWS_HEARD_MAX_S
+                if not armed and short and (kws_wake(label, prob) or (label == KWS_WAKE_LABEL and prob >= KWS_HEARD_P)):
                     live.earcon()
-                    tag, phrase = await asyncio.to_thread(updater.latest)
-                    live.speak(phrase + (" Скажи «Игорёк, обновись», чтобы поставить." if tag and command == "check"
-                                         else ""))
-                    done = await asyncio.to_thread(updater.install, tag) if tag and command == "install" else ""
-                    if tag and command == "install":
-                        live.speak(done or "Не смог скачать обновление, попробуй позже.")
+                    live.say_offline("heard")
                     await live.drain()
-                    if done.startswith("Обновляюсь"):
-                        updater.arm_watchdog()  # окно сторожа начинается здесь: озвучка уже позади (08.11: откат)
-                        restart_self(mic, "обновление")
-                    mic.flush()
-                    continue
-                action, complaint = station_report.report_command(" ".join(words[1:]))
-                if action:  # жалоба: текст issue собирает код, модель в этом не участвует
-                    live.earcon()
-                    live.speak(await asyncio.to_thread(reporter.file, complaint, action == "file"))
-                    await live.drain()
-                    mic.flush()
-                    continue
-                reply = await bt.handle(" ".join(words[1:]))
-                if reply:  # Bluetooth-музыка: решает код, ход модели не нужен
-                    live.earcon()
-                    live.speak(reply)
-                    await live.drain()
-                    mic.flush()
-                    continue
+                    buttons.arm(ring)
+                elif ring.state == "think":
+                    ring.idle()
+                mic.flush()
+                continue
+            text = buttons.address(wake_fix(text, label, prob))
+            if station_kws.wake_position(text, WAKE_WORDS) == "start":
+                tries = kws.promote_misses(now=t1)
+                if tries:
+                    log(f"🔑 вейк с {tries + 1}-й попытки: до этого {tries} фраз(ы) без имени — в kws_real/miss")
+            if await code_command(text, live, updater, reporter, bt, mic, hfp):
+                mic.flush()
+                continue
             log(f"🧠 окно до хода: записей {len(stand.engine.log.window())}, токенов {stand.engine.log.tokens()}")
-            result = await stand.hear(text, chat.CONSOLE_VOICE, source=chat.SOURCE_VOICE)
+            try:
+                result = await asyncio.wait_for(stand.hear(text, chat.CONSOLE_VOICE, source=chat.SOURCE_VOICE),
+                                                TURN_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                log(f"ход дольше {TURN_TIMEOUT_S:.0f} с — прерван")
+                await live.trouble("llm_fail" if await asyncio.to_thread(net_ok) else "no_net")
+                mic.flush()
+                continue
+            except Exception as exc:  # noqa: BLE001 — сбой хода не роняет хост (раньше — рестарт и тишина)
+                log(f"ход упал: {type(exc).__name__}: {str(exc)[:200]}")
+                await live.trouble("llm_fail" if await asyncio.to_thread(net_ok) else "no_net")
+                mic.flush()
+                continue
             t3 = time.time()
             if not result.addressed:
                 log(f"… не адресовано ({result.reason})")
+                if ring.state == "think" and not live.busy():
+                    ring.idle()
                 continue
             for line in result.log.splitlines():
                 if any(k in line for k in ("violation", "bad_", "repair", "rejected", "fields_dropped")):
@@ -746,7 +1128,7 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
             log(f"ход {t3 - t2:.2f} с: {result.said}")
             log(f"🧠 окно после хода: записей {len(stand.engine.log.window())}, токенов {stand.engine.log.tokens()}")
             await live.drain()
-            if wordless_tail(ring, result):
+            if wordless_tail(ring, result, buttons):
                 log(f"🎤 ход без слов — слушаю дальше {ARM_S:.0f} с")
             mic.flush()
     finally:
@@ -769,9 +1151,12 @@ class LiveOut:
         import functools  # noqa: PLC0415
 
         self._voice, self._mic, self._ring = voice, mic, ring
-        self._queue: asyncio.Queue[tuple[str, str | None]] = asyncio.Queue()
+        self._queue: asyncio.Queue[tuple[str, str | None, str]] = asyncio.Queue()  # (текст, голос, офлайн-ключ)
         self._stand = stand
         self._t1 = 0.0
+        self.offline = station_offline.OfflinePhrases(OFFLINE_DIR, log)
+        self._refreshing: asyncio.Future | None = None
+        stand.rbx_live = self
         self._player = asyncio.ensure_future(self._play())
         stage, say = stand.ports.stage, stand.speech.say
 
@@ -787,7 +1172,7 @@ class LiveOut:
         def live_say(turn_id, epoch, text, voice_id):
             ref = say(turn_id, epoch, text, voice_id)
             if text and text.strip():
-                self._queue.put_nowait((text, self.voice()))
+                self._queue.put_nowait((text, self.voice(), ""))
             return ref
 
         stand.ports.stage, stand.speech.say = live_stage, live_say
@@ -804,7 +1189,20 @@ class LiveOut:
             return None
         if applied and applied != os.environ.get("RBX_VOICE"):
             save_setting("RBX_VOICE", applied)  # голос, выбранный словами, переживает перезапуск
+            self.refresh_offline(delay=5.0)  # офлайн-фразы — новым голосом
         return applied or os.environ.get("RBX_VOICE") or None
+
+    def refresh_offline(self, delay: float = 0.0) -> None:
+        """Досинтезировать офлайн-фразы текущим голосом в фоне (пока сеть есть); уже идёт — не дублировать."""
+        if self._refreshing is not None and not self._refreshing.done():
+            return
+
+        async def run() -> None:
+            await asyncio.sleep(delay)
+            voice = self.voice() or ""
+            await self.offline.refresh(lambda text, v: self._voice.synth_pcm(text, v or None), voice)
+
+        self._refreshing = asyncio.ensure_future(run())
 
     def begin(self, t1: float) -> None:
         self._t1 = t1
@@ -819,26 +1217,67 @@ class LiveOut:
 
     async def _play(self) -> None:
         while True:
-            line, voice_id = await self._queue.get()
-            if self._ring:
+            line, voice_id, key = await self._queue.get()
+            if self._ring and self._ring.state != "error":
                 self._ring.set("speak")
+            started: list = []
+            mark = lambda: started.append(time.time())  # noqa: E731
             try:
-                started: list = []
-                synth = await self._voice.say(line, self._mic, on_sound=lambda: started.append(time.time()),
-                                              voice=voice_id)
-                gap = f"{started[0] - self._t1:.2f}" if started else "—"
-                log(f"🔊 синтез до звука {synth:.2f} с, от конца фразы до звука {gap} с, "
-                    f"голос {voice_id or '—'}: «{line}»")
+                key = key or self.offline.key_for(line)
+                cached = self.offline.pcm(key) if key else None
+                if key == "tone":
+                    await self._voice.play_pcm(station_offline.tone(line), self._mic, mark)
+                elif cached:  # заранее синтезированная — сразу, без сети
+                    await self._voice.play_pcm(cached, self._mic, mark)
+                    log(f"🔊 офлайн «{key}», от конца фразы до звука {self._gap(started)} с: «{line}»")
+                else:
+                    synth = await self._voice.say(line, self._mic, on_sound=mark, voice=voice_id)
+                    log(f"🔊 синтез до звука {synth:.2f} с, от конца фразы до звука {self._gap(started)} с, "
+                        f"голос {voice_id or '—'}: «{line}»")
             except Exception as exc:  # noqa: BLE001
                 log(f"реплика не прозвучала ({type(exc).__name__}): «{line}»")
+                if not started:  # синтез упал до звука — молчать нельзя: офлайн-фраза или тон ошибки
+                    await self._fallback_sound()
             finally:
                 self._queue.task_done()
-                if self._ring and self._queue.empty():
+                if self._ring and self._queue.empty() and self._ring.state != "error":
                     self._ring.idle()
 
-    def speak(self, text: str) -> None:
-        """Фраза кода (не хода модели) — в ту же очередь динамика."""
-        self._queue.put_nowait((text, self.voice()))
+    def _gap(self, started: list) -> str:
+        return f"{started[0] - self._t1:.2f}" if started else "—"
+
+    async def _fallback_sound(self) -> None:
+        if self._ring:
+            self._ring.flash("error", 2.0)
+        pcm = self.offline.pcm("tts_fail") or station_offline.tone("error")
+        try:
+            await self._voice.play_pcm(pcm, self._mic)
+            log("🔊 синтез не ответил — сыграл запасной звук")
+        except Exception as exc:  # noqa: BLE001
+            log(f"запасной звук не сыграл: {type(exc).__name__}")
+
+    def speak(self, text: str, key: str = "") -> None:
+        """Фраза кода (не хода модели) — в ту же очередь динамика; ``key`` — офлайн-фраза, если она уже есть."""
+        self._queue.put_nowait((text, self.voice(), key))
+
+    def say_offline(self, key: str) -> None:
+        """Офлайн-фраза по ключу, случайным вариантом: файл есть — звучит сразу, нет — синтезом или тоном."""
+        vid, text = self.offline.pick(key)
+        self.speak(text or key, vid or key)
+
+    def tone(self, kind: str) -> None:
+        self._queue.put_nowait((kind, None, "tone"))
+
+    async def trouble(self, key: str) -> None:
+        """Сбой, о котором человек должен узнать: кольцо «ошибка» и фраза, что именно не так (офлайн, без сети)."""
+        log(f"⚠ {key}: {self.offline.text(key)}")
+        if self._ring:
+            self._ring.flash("error", 2.5)
+        if self.offline.pcm(key) is None and key in ("no_net", "stt_fail", "llm_fail", "stt_limited"):
+            self.tone("error")  # фразы ещё нет, а сеть, скорее всего, и есть причина — тон точно прозвучит
+        else:
+            self.say_offline(key)
+        await self.drain()
 
     def busy(self) -> bool:
         return not self._queue.empty() or (self._voice.proc is not None and self._voice.proc.poll() is None)
@@ -854,7 +1293,7 @@ class LiveOut:
         await self._queue.join()
         # Ход без реплики (адресовано, но `said` пуст) ничего не кладёт в очередь — `_play` не проснётся,
         # и кольцо останется в «думаю» навсегда (08.11: «Игорёк, задумался» — think висел 3 минуты).
-        if self._ring and self._queue.empty():
+        if self._ring and self._queue.empty() and self._ring.state != "error":
             self._ring.idle()
 
     def close(self) -> None:
@@ -897,12 +1336,28 @@ def load_led_pattern(path: Path):
 class Ring:
     """Кольцо из трёх RGB-диодов (``/sys/class/leds/micro:{red,green,blue}:ring{1,2,3}``): состояние колонки эффектом.
 
-    Слушаю / думаю / говорю / подключаюсь к сети / ошибка — родные анимации Алисы (``RING_PATTERNS``), их нет —
-    эффекты кода (дыхание, бегущий огонёк, пульс). Микрофон выкл — ровный красный, громкость — белые диоды по уровню
-    на 1,2 с. Яркость ``LED_BRIGHT`` из 255: 255 — как у Алисы. В sysfs пишется только изменившееся."""
+    Стиль — ``RBX_RING_STYLE`` (страница настроек, читается на каждом кадре):
 
-    COLORS = {"off": (0, 0, 0), "listen": (0, 0, 1), "think": (1, 0, 1), "speak": (0, 1, 0), "muted": (1, 0, 0),
-              "connect": (1, 1, 1), "error": (1, 0, 0)}
+    * ``color`` (по умолчанию) — эффекты кода, у каждого диода свой цвет (:data:`PALETTES`). Шифу 09.11: «три
+      светодиода, а горят всегда одним цветом — нельзя разноцветно?» — у каждого диода свои R, G, B, можно.
+    * ``alice`` — родные анимации Алисы (``RING_PATTERNS``), где они есть; остальное — эффекты кода.
+
+    Микрофон выкл — ровный красный, громкость — белые диоды по уровню на 1,2 с. Яркость ``LED_BRIGHT`` из 255.
+    В sysfs пишется только изменившееся."""
+
+    #: Состояние → цвета трёх диодов (0..1). Оттенки рядом по кругу, чтобы бегущий огонёк переливался.
+    PALETTES = {
+        "off": ((0, 0, 0),) * 3,
+        "listen": ((0, 0.35, 1), (0, 0.9, 1), (0.35, 0, 1)),  # синий · бирюзовый · фиолетово-синий
+        "think": ((0.8, 0, 1), (1, 0, 0.45), (0.25, 0.1, 1)),  # фиолетовый · малиновый · индиго
+        "speak": ((0, 1, 0.15), (0.45, 1, 0), (0, 0.85, 0.6)),  # зелёный · салатовый · морская волна
+        "connect": ((1, 1, 1), (0.4, 0.7, 1), (1, 1, 1)),
+        "call": ((0, 1, 0.3), (0, 0.55, 1), (0, 1, 0.3)),  # разговор по телефону: зелёный с голубым
+        "muted": ((1, 0, 0),) * 3,
+        "error": ((1, 0, 0), (1, 0.35, 0), (1, 0, 0)),
+    }
+    #: Цвет состояния для экрана без анимации (один на всё кольцо) — первый цвет палитры.
+    COLORS = {state: colors[0] for state, colors in PALETTES.items()}
     FPS = 12
 
     def __init__(self, mic: Mic | None) -> None:
@@ -948,8 +1403,8 @@ class Ring:
         if self.state == "listen":
             k = 0.25 + 0.75 * (0.5 - 0.5 * math.cos(2 * math.pi * t / 1.6))
             return [k, k, k]
-        if self.state in ("think", "connect"):
-            head = (t / 0.9 * 3) % 3  # огонёк обходит три диода за 0,9 с
+        if self.state in ("think", "connect", "call"):
+            head = (t / (1.6 if self.state == "call" else 0.9) * 3) % 3  # огонёк обходит три диода за 0,9 с
             return [max(0.12, 1 - min(abs(i - head), 3 - abs(i - head))) for i in range(3)]
         if self.state == "speak":
             k = 0.45 + 0.55 * (0.5 - 0.5 * math.cos(2 * math.pi * t / 0.7))
@@ -978,7 +1433,8 @@ class Ring:
                 self._show([tuple(255 * c for c in rgb) if i < lit else (0, 0, 0) for i in range(3)])
             else:
                 self._override = None
-                pattern = self._patterns.get(self.state)
+                alice = os.environ.get("RBX_RING_STYLE", "color").strip().lower() == "alice"
+                pattern = self._patterns.get(self.state) if alice else None
                 frame = self._pattern_frame(pattern, now - self._since) if pattern else None
                 if frame is not None:
                     self._show(frame)
@@ -986,8 +1442,11 @@ class Ring:
                 elif pattern is not None:  # одноразовый шаблон (ошибка) кончился
                     self.idle()
                 else:
-                    rgb = self.COLORS[self.state]
-                    self._show([tuple(int(255 * c * k) for c in rgb) for k in self._frame(now - self._since)])
+                    colors = self.PALETTES.get(self.state, self.PALETTES["off"])
+                    if alice:  # стиль Алисы: эффекты кода одним цветом, как раньше
+                        colors = (colors[0],) * 3
+                    self._show([tuple(int(255 * c * k) for c in rgb)
+                                for rgb, k in zip(colors, self._frame(now - self._since))])
                     if self.state in ("off", "muted"):
                         wait = 0.2  # без анимации — реже просыпаться
             await asyncio.sleep(wait)
@@ -1057,6 +1516,7 @@ class Buttons:
         self._mic, self._ring, self._live, self.auth = mic, ring, live, auth
         self.volume = int(VOLUME)
         self.armed_until = 0.0
+        self.hfp = None  # звонок: кнопка Алисы принимает/сбрасывает (station_hfp)
 
     def on_key(self, code: int) -> None:
         if self.auth is not None:
@@ -1072,6 +1532,8 @@ class Buttons:
             self._mic.flush()
             if not self._live.busy():
                 self._ring.idle()
+            # голосом, а не только красным кольцом: днём кольцо плохо видно (Шифу 09.11: «непонятно, что произошло»)
+            self._live.say_offline("mic_off" if self._mic.user_muted else "mic_on")
             log(f"🔘 микрофон {'выключен' if self._mic.user_muted else 'включён'}")
         elif code == KEY_ACTION:
             self._action()
@@ -1086,6 +1548,11 @@ class Buttons:
         log(f"🔘 громкость {self.volume}")
 
     def _action(self) -> None:
+        hfp = self.hfp
+        if hfp is not None and (hfp.ringing or hfp.in_call):
+            asyncio.ensure_future(hfp.press())
+            log(f"🔘 звонок: {'сброс' if hfp.in_call else 'принять'}")
+            return
         if self._live.busy():
             self._live.stop()
             log("🔘 стоп: речь оборвана кнопкой")
@@ -1113,6 +1580,18 @@ class Buttons:
         if time.time() >= self.armed_until and self._ring.state == "listen":
             self._ring.idle()
 
+    def armed(self) -> bool:
+        """Идёт окно «слушаю без вейка» (кнопка, голое имя, «Слушаю.»)."""
+        return time.time() < self.armed_until
+
+    def arm(self, ring: "Ring | None" = None, seconds: float = ARM_S) -> None:
+        """Окно без вейка без щелчка: следующая фраза адресована колонке, и команды кода (обновись, пожалуйся)
+        в ней работают — 08.11 «Игорёк» … «проверь обновления» ушло модели, и та ответила «не могу» (#13)."""
+        self.armed_until = time.time() + seconds
+        ring = ring or self._ring
+        ring.set("listen")
+        asyncio.get_running_loop().call_later(seconds, self._disarm)
+
     def address(self, text: str) -> str:
         """Фраза после кнопки Алисы адресована колонке: без вейка код подставляет его сам."""
         if not text or time.time() >= self.armed_until:
@@ -1129,7 +1608,8 @@ async def start_setup(stand, mic: Mic, ring: Ring, buttons: "Buttons") -> None:
 
     auth = setup.Auth()
     buttons.auth = auth
-    for name, value in (("RBX_WAKE", ",".join(WAKE_WORDS)), ("RBX_VOLUME", VOLUME), ("RBX_LED", str(LED_BRIGHT))):
+    for name, value in (("RBX_WAKE", ",".join(WAKE_WORDS)), ("RBX_VOLUME", VOLUME), ("RBX_LED", str(LED_BRIGHT)),
+                        ("RBX_RING_STYLE", "color")):
         os.environ.setdefault(name, value)  # форма страницы показывает то, что сейчас в силе
 
     def identify() -> None:
@@ -1149,11 +1629,8 @@ async def start_setup(stand, mic: Mic, ring: Ring, buttons: "Buttons") -> None:
         if keys:  # провайдеры собраны при старте — новые ключи берёт только новый процесс
             asyncio.get_running_loop().call_later(1.0, restart_self, mic)
 
-    improv = setup.Improv(auth, identify, log)
-    try:
-        await improv.start()
-    except Exception as exc:  # noqa: BLE001
-        log(f"📶 Improv не поднялся: {type(exc).__name__}: {exc}")
+    # страница первой и Improv под тайм-аутом: 09.11 BlueZ не ответил на регистрацию Improv (после перезапусков
+    # bluealsa для звонков), ``await improv.start()`` повис — и вместе с ним страница, приветствие и весь слух колонки
     try:
         await setup.SettingsServer(SETTINGS, CORE / "scripts" / "dialogue" / ".env", auth, on_saved, log,
                                    prompts=station_prompts(setup),
@@ -1162,6 +1639,13 @@ async def start_setup(stand, mic: Mic, ring: Ring, buttons: "Buttons") -> None:
                                    on_wifi=lambda ok: wifi_done(ok, ring, mic)).start()
     except OSError as exc:
         log(f"⚙ страница настроек не поднялась: {exc}")
+    improv = setup.Improv(auth, identify, log)
+    try:
+        await asyncio.wait_for(improv.start(), IMPROV_START_S)
+    except asyncio.TimeoutError:
+        log(f"📶 Improv не ответил за {IMPROV_START_S:.0f} с — без Wi-Fi по Bluetooth, остальное работает")
+    except Exception as exc:  # noqa: BLE001
+        log(f"📶 Improv не поднялся: {type(exc).__name__}: {exc}")
 
 
 def wifi_done(ok: bool, ring: "Ring", mic: Mic) -> None:
@@ -1171,7 +1655,7 @@ def wifi_done(ok: bool, ring: "Ring", mic: Mic) -> None:
         asyncio.get_running_loop().call_later(4.0, restart_self, mic, "сеть Wi-Fi")
 
 
-def wordless_tail(ring: "Ring | None", result) -> bool:
+def wordless_tail(ring: "Ring | None", result, buttons: "Buttons | None" = None) -> bool:
     """Ход без слов (ядро: ``Addressed("", BARE_WAKE)`` — голое «Игорёк»): показать, что продолжаем слушать.
 
     08.11 Шифу: «на Игорька он булькает, но молчит» — кольцо гасилось сразу после earcon, и человек
@@ -1180,6 +1664,9 @@ def wordless_tail(ring: "Ring | None", result) -> bool:
     """
     if ring is None or not getattr(result, "addressed", False) or getattr(result, "said", None):
         return False
+    if buttons is not None:
+        buttons.arm(ring)  # и фраза следом без имени — колонке (с командами кода), а не только кольцо
+        return True
     ring.set("listen")
     asyncio.get_running_loop().call_later(ARM_S, ring.idle)
     return True
@@ -1225,10 +1712,15 @@ def station_prompts(setup):
 SELF = str(Path(__file__).resolve())
 
 
-def restart_self(mic: Mic, why: str = "сменились ключи") -> None:
-    """Перезапуск хоста тем же процессом (init-цикл не считает это падением): новые ключи, промпт, версия."""
+def restart_self(mic: Mic, why: str = "сменились ключи", announce: bool = True) -> None:
+    """Перезапуск хоста тем же процессом (init-цикл не считает это падением): новые ключи, промпт, версия.
+
+    ``announce`` — сказать «Перезапускаюсь» офлайн-фразой (у обновления своя фраза — там ``False``)."""
     log(f"⚙ перезапуск хоста: {why}")
     mic.proc.kill()
+    pcm = station_offline.OfflinePhrases(OFFLINE_DIR, log).pcm("restarting") if announce else None
+    if pcm:
+        subprocess.run(aplay_cmd(), input=pcm, check=False, timeout=15)
     os.execv(sys.executable, [sys.executable, "-X", "utf8", "-u", SELF] + sys.argv[1:])
 
 

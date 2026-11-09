@@ -1,0 +1,91 @@
+# Ассеты установки колонки — из исходников, к релизу тега (#4547, #4549, #4552 в krikz/rob_box_project):
+#   station-runtime-armv7.tar.gz  Питон 3.12 armv7 + библиотеки (tools/build_runtime.py по tools/runtime.lock)
+#   station-core.tar.gz           ядро диалога из коммита tools/core_ref.txt (tools/build_core.py)
+#   station-kws-armv7.tar.gz      своя модель вейка: kws_run из kws_run.c + веса (tools/build_kws.py)
+#   SHA256SUMS
+# Сборки детерминированные: тот же вход — байт в байт тот же архив (сверено 09.11 с колонкой 10.1.1.13).
+name: assets
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "тег, к релизу которого приложить ассеты (пусто — только собрать, артефакт workflow)"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Коммит ядра
+        id: core
+        run: echo "sha=$(head -1 tools/core_ref.txt | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: krikz/rob_box_project
+          ref: ${{ steps.core.outputs.sha }}
+          path: rbp
+          fetch-depth: 1
+          lfs: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/cache@v4
+        with:
+          path: dl_runtime
+          key: runtime-${{ hashFiles('tools/runtime.lock') }}
+
+      - name: Рунтайм
+        run: python -I tools/build_runtime.py station-runtime-armv7.tar.gz --cache dl_runtime
+
+      - name: Ядро
+        run: python -I tools/build_core.py rbp station-core.tar.gz --ref "${{ steps.core.outputs.sha }}"
+
+      - name: Модель вейка
+        run: |
+          bash training/kws/build_kws.sh
+          python -I tools/build_kws.py training/kws/out/kws_run.armv7 station-kws-armv7.tar.gz
+
+      - name: Проверка архивов
+        run: |
+          set -e
+          tar tzf station-runtime-armv7.tar.gz | grep -qx 'python/bin/python3.12'
+          tar tzf station-runtime-armv7.tar.gz | grep -q '^rbx/site/openai/'
+          tar tzf station-core.tar.gz | grep -qx 'rbx/core/scripts/dialogue/chat.py'
+          tar tzf station-core.tar.gz | grep -qx 'rbx/core/SOURCE'
+          ! tar tzf station-core.tar.gz | grep -q '\.env$'
+          tar tzf station-kws-armv7.tar.gz | grep -qx 'rbx/kws/kws_run'
+          sha256sum station-runtime-armv7.tar.gz station-core.tar.gz station-kws-armv7.tar.gz | tee SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: station-assets
+          path: |
+            station-runtime-armv7.tar.gz
+            station-core.tar.gz
+            station-kws-armv7.tar.gz
+            SHA256SUMS
+
+      - name: К релизу
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+        if: ${{ github.event_name == 'push' || inputs.tag != '' }}
+        run: |
+          set -e
+          files="station-runtime-armv7.tar.gz station-core.tar.gz station-kws-armv7.tar.gz SHA256SUMS"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" $files --clobber
+          else
+            gh release create "$TAG" $files --title "$TAG" --notes "Ассеты установки колонки (install.sh): рунтайм, ядро, модель вейка. Проверка — SHA256SUMS."
+          fi

@@ -59,6 +59,56 @@ class BtMedia:
         props, iface = await self._props("/org/bluez/hci0", "org.bluez.Adapter1")
         await props.call_set(iface, name, Variant(sig, value))
 
+    async def watch_connections(self, on_change: Callable[[str, bool], None]) -> None:
+        """Телефон подключился / отключился (``org.bluez.Device1.Connected``) → ``on_change(имя, подключён)``.
+
+        Шифу 09.11: «когда подключаемся к Игорьку по блютузу, логично издать приятный звук». Отпускание Hands-Free
+        во время звонка (``station_hfp``) соединение не рвёт — музыка остаётся, звука не будет.
+        """
+        from dbus_next import Message, MessageType  # noqa: PLC0415
+
+        bus = await self._connect()
+        rule = ("type='signal',sender='org.bluez',interface='org.freedesktop.DBus.Properties',"
+                "member='PropertiesChanged',arg0='org.bluez.Device1'")
+        await bus.call(Message(destination="org.freedesktop.DBus", path="/org/freedesktop/DBus",
+                               interface="org.freedesktop.DBus", member="AddMatch", signature="s", body=[rule]))
+        last: dict = {}
+
+        def handler(msg) -> None:
+            if (msg.message_type != MessageType.SIGNAL or msg.member != "PropertiesChanged" or not msg.body
+                    or msg.body[0] != "org.bluez.Device1" or "Connected" not in msg.body[1]):
+                return
+            up = bool(msg.body[1]["Connected"].value)
+            if last.get(msg.path) == up:
+                return
+            last[msg.path] = up
+            asyncio.ensure_future(self._report(msg.path, up, on_change))
+
+        bus.add_message_handler(handler)
+        self.log("🎵 Bluetooth: слежу за подключением телефонов")
+
+    async def _report(self, path: str, up: bool, on_change: Callable[[str, bool], None]) -> None:
+        name = path.rsplit("/", 1)[-1]
+        try:
+            props, _ = await self._props(path, "org.bluez.Device1")
+            name = (await props.call_get("org.bluez.Device1", "Alias")).value or name
+        except Exception:  # noqa: BLE001 — устройство уже ушло: хватит адреса
+            pass
+        self.log(f"🎵 Bluetooth: {name} {'подключился' if up else 'отключился'}")
+        on_change(name, up)
+
+    async def ensure_alias(self) -> None:
+        """Имя колонки для телефонов — при каждом старте хоста: BlueZ хранит его в ОЗУ, и 09.11 после перезагрузки
+        колонка снова называлась «Яндекс Лайт», хотя телефон Шифу знал её как «Игорёк»."""
+        try:
+            props, iface = await self._props("/org/bluez/hci0", "org.bluez.Adapter1")
+            current = (await props.call_get(iface, "Alias")).value
+            if current != ALIAS:
+                await self._set("Alias", "s", ALIAS)
+                self.log(f"🎵 Bluetooth: имя «{current}» → «{ALIAS}»")
+        except Exception as exc:  # noqa: BLE001 — без BlueZ колонка всё равно работает
+            self.log(f"🎵 Bluetooth: имя не поставлено: {type(exc).__name__}: {exc}")
+
     async def pair(self) -> str:
         """Колонка видна телефону ``PAIR_S`` секунд и принимает сопряжение (агент «just works» — без кода)."""
         await self._set("Alias", "s", ALIAS)

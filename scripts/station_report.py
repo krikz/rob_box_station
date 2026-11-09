@@ -20,8 +20,11 @@ from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 
 REPO = os.environ.get("RBX_REPORT_REPO", "krikz/rob_box_station")
-#: Пауза между жалобами: защита от «пожалуйся, пожалуйся, пожалуйся» и от спама в репозиторий.
+#: Та же жалоба второй раз в это окно не уходит («пожалуйся, пожалуйся, пожалуйся» — один issue).
 COOLDOWN_S = float(os.environ.get("RBX_REPORT_COOLDOWN_S", "600"))
+#: Между разными жалобами — короткая пауза: 08.11 вторая, другая жалоба через 2 мин получила «подожди 8 мин» и
+#: потерялась (#16). Спам в репозиторий это всё равно режет.
+GAP_S = float(os.environ.get("RBX_REPORT_GAP_S", "45"))
 #: Сколько значимых строк лога кладём в issue и сколько символов всего (issue не должен быть свалкой).
 MAX_LINES, MAX_CHARS = 120, 12000
 MASK = "***"
@@ -63,7 +66,8 @@ _SECRET_PATTERNS = (
 )
 
 _TRIGGER_RE = re.compile(
-    r"(?i)\b(?:пожалуй(?:ся|тесь)|пожаловаться|передай\s+разработчику|"
+    r"(?i)\b(?:пожалуй(?:ся|тесь)|пожаловаться|жалуюсь|"
+    r"(?:передай|передайте|скажи|сообщи)\s+(?:это\s+)?разработчик(?:у|ам|ами)?|"
     r"(?:заведи|заведите|завести|создай|создайте|оставь|оставьте|запости|отправь|напиши)\s+"
     r"(?:баг|багу|задачу|ишью|issue))\b"
 )
@@ -287,13 +291,57 @@ class Reporter:
             return "Скажи, на что жаловаться: «Игорёк, пожалуйся, что не слышишь меня»."
         if not token:
             return "Жалобу отправлять нечем: впиши токен гитхаба на странице настроек."
-        now, state = time.time(), self.state()
-        wait = COOLDOWN_S - (now - float(state.get("at") or 0))
-        if wait > 0:
-            if state.get("hash") == self.digest(complaint):
-                return f"Эту жалобу уже отправил, номер {state.get('number', '?')}."
-            return f"Только что отправлял жалобу, подожди {int(wait // 60) + 1} мин."
+        busy = self.too_soon(complaint)
+        if busy:
+            return busy
         title, body = self.draft(complaint, with_log)
+        return self.post(complaint, title, body)
+
+    def too_soon(self, complaint: str) -> str:
+        """Фраза отказа, если жалобу сейчас слать нельзя (та же — в окне ``COOLDOWN_S``, любая — в ``GAP_S``)."""
+        now, state = time.time(), self.state()
+        since = now - float(state.get("at") or 0)
+        if state.get("hash") == self.digest(complaint) and since < COOLDOWN_S:
+            return f"Эту жалобу уже отправил, номер {state.get('number', '?')}."
+        if since < GAP_S:
+            return f"Только что отправлял жалобу, подожди {int(GAP_S - since) + 1} секунд."
+        return ""
+
+    def file_by_model(self, complaint: str, title: str = "", details: str = "", with_log: bool = True) -> dict:
+        """Тул модели ``report_issue``: модель даёт жалобу словами человека, заголовок и суть, код — остальное.
+
+        Второго вызова LLM нет (тул класса ``query`` ждут 15 с): тело собирает код — цитата, суть от модели,
+        версия, настройки, лог. Возвращает данные для модели (``status``, ``say``, номер), а не фразу.
+        """
+        token = self.token().strip()
+        complaint = " ".join((complaint or "").split())
+        if not complaint:
+            return {"status": "rejected", "reason": "no_complaint",
+                    "say": "Скажи, на что жаловаться, — я заведу issue."}
+        if not token:
+            return {"status": "rejected", "reason": "no_token",
+                    "say": "Жалобу отправлять нечем: впиши токен гитхаба GH_ISSUE_TOKEN на странице настроек."}
+        busy = self.too_soon(complaint)
+        if busy:
+            return {"status": "rejected", "reason": "cooldown", "say": busy}
+        head = mask_secrets(" ".join((title or "").split()))
+        head = self.title(head[len("колонка:"):].strip() if head.lower().startswith("колонка:") else head or complaint)
+        parts = ["## Что случилось", "", f"> {complaint}", ""]
+        if details.strip():
+            parts += [mask_secrets(details.strip()), ""]
+        parts += ["## Устройство", "", f"- версия колонки: `{self.version()}`"]
+        parts += [f"- {name}: {value}" for name, value in self.context().items()]
+        if with_log:
+            parts += ["", "## Что видно в логе", "", "```", self.excerpt() or "лог пуст", "```"]
+        parts += ["", "_Заведено инструментом модели `report_issue` по просьбе человека голосом._"]
+        say = self.post(complaint, head, "\n".join(parts) + "\n")
+        if not say.startswith("Завёл"):
+            return {"status": "rejected", "reason": "github_failed", "say": say}
+        return {"status": "done", "issue_number": self.state().get("number"), "say": say}
+
+    def post(self, complaint: str, title: str, body: str) -> str:
+        """POST issue → фраза колонке; удача запоминается (номер, хэш, время) для пауз."""
+        token, now = self.token().strip(), time.time()
         try:
             status, answer = _post(f"https://api.github.com/repos/{REPO}/issues", token,
                                    {"title": title, "body": body})

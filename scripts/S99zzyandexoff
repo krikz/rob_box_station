@@ -15,6 +15,9 @@ off() {
 }
 case "$1" in
   start) [ -f "$MARK" ] && ( sleep 20; off ) </dev/null >/dev/null 2>&1 & ;;
+  # установщик по ssh: сразу и в переднем плане — фон из ssh-сессии умирал с ней по SIGHUP (#4551 rob_box_project)
+  now) [ -f "$MARK" ] && off; n=$(ps | grep -v grep | grep -cE 'quasar_launcher2|maind --'); echo "алиса: осталось $n"
+       [ "$n" -eq 0 ]; exit $? ;;
   stop) ;;
 esac
 exit 0
