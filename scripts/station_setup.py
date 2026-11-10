@@ -7,9 +7,9 @@
   приоритетом выше прочих; старые не выключаются. Не подключилась за ``WIFI_WAIT_S`` — сеть удаляется, колонка
   возвращается в прежнюю сама.
 * **Страница настроек** ``http://<колонка>:8080/``: вейк, голос, громкость, яркость кольца, ключи LLM/TTS (видны
-  только последние 4 знака), промпт (основа + дополнение колонки, свои копии — ``Prompts``), смена сети Wi-Fi (тем же
-  безопасным ``connect_wifi``). Сохранение — только в окно после нажатия любой кнопки колонки (как Improv): чужой
-  в сети не сменит.
+  только последние 4 знака), промпт (персона + дополнение колонки, свои копии — ``Prompts``; основу промпта даёт
+  ядро v0.7.2), смена сети Wi-Fi (тем же безопасным ``connect_wifi``). Сохранение — только в окно после нажатия
+  любой кнопки колонки (как Improv): чужой в сети не сменит.
 
 Чистые функции (разбор пакетов Improv, проверка настроек, форма) — без D-Bus, их гоняет ``tests/test_station_setup.py``.
 """
@@ -236,15 +236,40 @@ def mask(value: str) -> str:
     return "не задан" if not value else f"…{value[-4:]}"
 
 
-class Prompts:
-    """Промпт колонки: основа (свой файл или файл ядра) + дополнение колонки. Файлы ядра не правятся: свои копии —
-    в ``own_dir``; ход собирается из ``materialize`` (каталог, который хост отдаёт стенду как ``PROMPT_DIR``)."""
+#: Персона колонки по умолчанию (factory): два блока через пустую строку — кто ты (identity) и характер (character),
+#: формат ``rob_box_dialog.prompts.parse_persona``. install.sh кладёт её копию в ``BASE/prompts/persona.txt`` (её и
+#: правят на странице настроек); константа — запасной источник, если своя копия удалена.
+DEFAULT_PERSONA = """You are Игорёк — a friendly smart speaker companion.
 
-    FILE, EXTRA = "master_prompt_compact.txt", "station_extra.txt"
+- Friendly and brief, call yourself «Игорёк». Emotions — `expression`.
+- Roleplay: «стань [персонаж]» / «ты [персонаж]» — speak AS the character from the first word and hold the role
+  until told «выход из роли» / «ты снова Игорёк».
+"""
+
+#: У колонки нет агента-оператора, а формат профиля (4) требует файл персоны оператора рядом с assistant.yaml —
+#: нейтральная заглушка.
+DEFAULT_OPERATOR_PERSONA = """You are the operator agent of this speaker.
+
+- You act on behalf of the operator who manages the speaker remotely. Be useful, precise and honest.
+"""
+
+#: Владельцы тулов колонки (порты ``rob_box_dialog.owners``): только то, что колонка честно исполняет (хендлеры в
+#: ``install_station_tools``); музыка, лицо, звуки, движение, камера у колонки нет — модель этих тулов не видит
+#: вовсе (честнее, чем отказ вызовом, — 07.11 колонка отвечала «заряд 87 %» за то, чего у неё нет, ADR-0167 §2.4).
+PROFILE_OWNERS = ("speech", "memory", "clock", "web", "battery", "perception")
+
+
+class Prompts:
+    """Промпт колонки на ядре v0.7.2: персона (своя или заводская) + дополнение. Основа системного промпта —
+    в данных ядра (``rob_box_dialog.prompts``) и сюда не копируется: колонка настраивает персону (два блока:
+    кто ты, характер) и дополнение, а хост отдаёт их ядру через профиль продукта (``persona.txt`` рядом с
+    ``assistant.yaml``) и ``system_patch`` хода (дополнение + факты устройства дописываются в конец промпта)."""
+
+    PERSONA, EXTRA = "persona.txt", "station_extra.txt"
     MAX_CHARS = 20000
 
-    def __init__(self, core_dir: Path, own_dir: Path) -> None:
-        self.core_dir, self.own_dir = core_dir, own_dir
+    def __init__(self, own_dir: Path, default_persona: str = DEFAULT_PERSONA):
+        self.own_dir, self.default_persona = own_dir, default_persona
 
     def _read(self, path: Path) -> str:
         try:
@@ -252,45 +277,65 @@ class Prompts:
         except OSError:
             return ""
 
-    def core(self) -> str:
-        return self._read(self.core_dir / self.FILE)
+    def persona(self) -> str:
+        own = self.own_dir / self.PERSONA
+        return self._read(own) if own.is_file() else self.default_persona
 
     def is_own(self) -> bool:
-        return (self.own_dir / self.FILE).exists()
-
-    def base(self) -> str:
-        return self._read(self.own_dir / self.FILE) if self.is_own() else self.core()
+        return (self.own_dir / self.PERSONA).is_file()
 
     def extra(self) -> str:
         return self._read(self.own_dir / self.EXTRA)
 
-    def effective(self) -> str:
-        extra = self.extra().strip()
-        return self.base().rstrip() + ("\n\n# STATION (колонка «Игорёк»)\n" + extra + "\n" if extra else "\n")
+    def system_patch(self, facts: str = "") -> Callable[[str], str]:
+        """Правка системного промпта хода (шов ``build_real_stand``): дополнение колонки, потом факты устройства."""
 
-    def materialize(self, out_dir: Path, facts: str = "") -> Path:
-        """Собрать промпт хода в ``out_dir``: основа + дополнение + ``facts`` (факты устройства строит код хоста)."""
-        out_dir.mkdir(parents=True, exist_ok=True)
-        section = f"\n# DEVICE FACTS (built by code at start, true)\n{facts.strip()}\n" if facts else ""
-        text = self.effective() + section
-        (out_dir / self.FILE).write_text(text, encoding="utf-8")
-        return out_dir
+        def patch(system: str) -> str:
+            text = system.rstrip()
+            if self.extra().strip():
+                text += "\n\n# STATION (колонка «Игорёк»)\n" + self.extra().strip()
+            if facts.strip():
+                text += "\n\n# DEVICE FACTS (built by code at start, true)\n" + facts.strip()
+            return text + "\n"
 
-    def save(self, base: str, extra: str, reset: bool) -> str:
-        """Записать основу (совпала с ядром или ``reset`` — своя копия удаляется) и дополнение; итог словами."""
-        base, extra = base.replace("\r\n", "\n"), extra.replace("\r\n", "\n")
-        if len(base) > self.MAX_CHARS or len(extra) > self.MAX_CHARS:
+        return patch
+
+    def write_profile(self, profile_dir: Path, wake: List[str]) -> Path:
+        """Профиль продукта колонки (формат ядра 4): ``assistant.yaml`` + таблица вейков и персоны рядом с ним.
+        Сухой стенд ядра читает профиль именно с этого пути (``REPO/docker/sound/config``); пишем на каждый старт:
+        вейк меняется со страницы, обновление ядра затирает каталог целиком."""
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        persona = self.persona().strip()
+        if "\n\n" not in persona:
+            raise ValueError("персона: ждали два блока через пустую строку — кто ты (identity) и характер (character)")
+        (profile_dir / "persona.txt").write_text(persona + "\n", encoding="utf-8")
+        (profile_dir / "operator_persona.txt").write_text(DEFAULT_OPERATOR_PERSONA, encoding="utf-8")
+        (profile_dir / "wake_words.yaml").write_text(
+            "personality:\n" + "".join(f"  - {w}\n" for w in wake) + "operator: []\n", encoding="utf-8")
+        (profile_dir / "assistant.yaml").write_text(
+            "format: 4\n"
+            "name: Игорёк\n"
+            "wake_words: wake_words.yaml\n"
+            "persona: persona.txt\n"
+            "operator_persona: operator_persona.txt\n"
+            "owners:\n" + "".join(f"  - {o}\n" for o in PROFILE_OWNERS), encoding="utf-8")
+        return profile_dir / "assistant.yaml"
+
+    def save(self, persona: str, extra: str, reset: bool) -> str:
+        """Записать персону (совпала с заводской или ``reset`` — своя копия удаляется) и дополнение; итог словами."""
+        persona, extra = persona.replace("\r\n", "\n"), extra.replace("\r\n", "\n")
+        if len(persona) > self.MAX_CHARS or len(extra) > self.MAX_CHARS:
             raise ValueError(f"промпт длиннее {self.MAX_CHARS} знаков")
-        if not reset and not base.strip():
-            raise ValueError("основа промпта пустая — отметь «вернуть промпт ядра», если нужен он")
+        if not reset and not persona.strip():
+            raise ValueError("персона пустая — отметь «вернуть персону колонки», если нужна заводская")
         self.own_dir.mkdir(parents=True, exist_ok=True)
-        own = self.own_dir / self.FILE
-        if reset or base.strip() == self.core().strip():
+        own = self.own_dir / self.PERSONA
+        if reset or persona.strip() == self.default_persona.strip():
             own.unlink(missing_ok=True)
-            kind = "основа — ядра"
+            kind = "персона — заводская"
         else:
-            own.write_text(base, encoding="utf-8")
-            kind = "основа — своя"
+            own.write_text(persona, encoding="utf-8")
+            kind = "персона — своя"
         (self.own_dir / self.EXTRA).write_text(extra, encoding="utf-8")
         return f"{kind}, дополнение {len(extra.strip())} знаков"
 
@@ -332,13 +377,14 @@ def render_page(settings: Dict[str, str], env: Dict[str, str], note: str = "", p
     msg = f'<p class="note">{html.escape(note)}</p>' if note else ""
     prompt_form = ""
     if prompts is not None:
-        whose = "своя (правлена здесь)" if prompts.is_own() else "из ядра"
+        whose = "своя (правлена здесь)" if prompts.is_own() else "заводская колонки"
         prompt_form = f"""<h2>Промпт</h2><form method="post" action="/prompt">
-<label>Дополнение для колонки <small>дописывается в конец системного промпта: имя, характер, правила колонки</small>
+<label>Дополнение для колонки <small>дописывается в конец системного промпта: правила и факты колонки</small>
 <textarea name="extra" rows="8">{html.escape(prompts.extra())}</textarea></label>
-<label>Основа системного промпта <small>сейчас {whose}; код ядра дописывает к ней свои разделы</small>
-<textarea name="base" rows="18">{html.escape(prompts.base())}</textarea></label>
-<label class="check"><input type="checkbox" name="reset" value="1">вернуть основу ядра</label>
+<label>Персона колонки <small>сейчас {whose}; два блока через пустую строку: кто ты (identity) и характер (character).
+Основу промпта (правила хода) даёт ядро и не правится здесь</small>
+<textarea name="persona" rows="8">{html.escape(prompts.persona())}</textarea></label>
+<label class="check"><input type="checkbox" name="reset" value="1">вернуть персону колонки</label>
 <button type="submit">Сохранить промпт</button> <small>колонка перезапустится (~10 с)</small></form>"""
     wifi_form = ""
     if wifi is not None:
@@ -475,7 +521,7 @@ class SettingsServer:
     def _prompt(self, form: Dict[str, str]) -> str:
         if self.prompts is None:
             raise ValueError("промпт здесь не настраивается")
-        done = self.prompts.save(form.get("base", ""), form.get("extra", ""), form.get("reset") == "1")
+        done = self.prompts.save(form.get("persona", ""), form.get("extra", ""), form.get("reset") == "1")
         self.log(f"⚙ промпт сохранён со страницы: {done}")
         if self.on_prompt:
             self.on_prompt()

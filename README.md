@@ -16,7 +16,7 @@ TTS → динамик. Границы и план — ADR-0167 в `krikz/rob_bo
 | Автозапуск хоста при загрузке | **нет** — запущен руками `setsid nohup`, после reboot не встанет |
 | Кнопки, кольцо LED | не начато |
 | Настройка Wi-Fi по Bluetooth, страница настроек | не начато (ADR-0167 Ш6) |
-| Ядро как пакет из `krikz/rob_box_dialog_core` по тегу | ждёт ADR-0167 Ш1–Ш2; сейчас файлы ядра льются из чекаута `rob_box_project` |
+| Ядро из `krikz/rob_box_dialog_core` по тегу | **сделано** (Ш3, v0.7.2): `tools/core_ref.txt` — тег, бандлит `tools/build_core.py` |
 
 ## Установка одной строкой
 
@@ -35,7 +35,7 @@ curl -sL https://raw.githubusercontent.com/krikz/rob_box_station/main/install.sh
 | Ассет | Что | Сборка (детерминированная) |
 |---|---|---|
 | `station-runtime-armv7.tar.gz` | Питон 3.12.16 armv7 + библиотеки → `/data/opt/python`, `rbx/site` | `tools/build_runtime.py` по `tools/runtime.lock` (URL + sha256) |
-| `station-core.tar.gz` | ядро диалога → `rbx/core` (`.env` переносится) | `tools/build_core.py` из коммита `tools/core_ref.txt` `rob_box_project` |
+| `station-core.tar.gz` | ядро диалога → `rbx/core` (`.env` переносится) | `tools/build_core.py` по тегу `tools/core_ref.txt` из `krikz/rob_box_dialog_core` |
 | `station-kws-armv7.tar.gz` | своя модель вейка → `rbx/kws` (необязательна) | `kws_run.c` → `build_kws.sh`, веса `training/kws/models/` |
 
 Собирает их CI (`.github/workflows/assets.yml`) на каждый тег `v*` и прикладывает к релизу с `SHA256SUMS`; руками —
@@ -217,9 +217,12 @@ ssh -p 2222 root@10.1.1.13 '/etc/init.d/S99zzzrbxhost restart'   # без пер
    * **Страница настроек** `http://<колонка>:8080/`: вейк, голос, громкость, яркость, ключи (видны хвосты). Сохранить —
      только после нажатия любой кнопки колонки (без него 403). Настройки — `/data/opt/rbx/settings.json`, ключи — в `.env`; новые ключи
      перезапускают хост (`execv`).
-   * **Промпт на странице**: «дополнение для колонки» (в конец системного промпта) и «основа» (свой текст вместо
-     `master_prompt_compact.txt` ядра, «вернуть основу ядра»). Свои копии — `/data/opt/rbx/prompts/`, ядро не правится;
-     хост собирает промпт в `<workdir>/prompt` и отдаёт стенду как `PROMPT_DIR`. Сохранение перезапускает хост.
+  * **Промпт на странице**: «дополнение для колонки» (в конец системного промпта) и «персона» (два блока: кто ты и
+    характер, «вернуть персону колонки»). Основу промпта (правила хода) даёт ядро v0.7.2 (`rob_box_dialog.prompts`)
+    и здесь не правится; хост пишет персону и вейк в профиль продукта (`rbx/core/docker/sound/config/`, формат ядра 4),
+    дополнение и факты устройства дописывает `system_patch`-ом хода. Свои копии — `/data/opt/rbx/prompts/`
+    (persona.txt, station_extra.txt). Сохранение перезапускает хост. Старый `master_prompt_compact.txt` ядром не
+    читается — переноси персону в persona.txt (хост пишет подсказку в лог).
    * **Wi-Fi на странице**: текущая сеть, список вокруг (`wpa_cli scan_results`), подключение тем же безопасным путём,
      что Improv; итог — кольцо мигает зелёным/красным и строка «последняя попытка» на странице.
 6. ADR-0167 Ш1 в `rob_box_project` (промпт, `wake_words.yaml`, `migrations/*.sql` — в пакет ядра), затем Ш2 — залить
@@ -237,7 +240,7 @@ ssh -p 2222 root@10.1.1.13 'mount -o remount,rw / && cat > /etc/init.d/S99zzyand
 ```
 /data/opt/python/            Питон 3.12 (python-build-standalone armv7, обрезан)
 /data/opt/rbx/site/          колёса armv7: openai, httpx, pydantic, … + PyYAML (чистый Питон)
-/data/opt/rbx/core/          файлы ядра из rob_box_project (src/<пакет>/<пакет>, scripts/dialog*, prompts, migrations)
+/data/opt/rbx/core/          файлы ядра из krikz/rob_box_dialog_core по тегу (src/<пакет>/<пакет>, scripts/dialog*); плюс профиль колонки (docker/sound/config/, пишет хост при старте)
 /data/opt/rbx/core/scripts/dialogue/.env   ключи (0600, root)
 /data/opt/rbx/station_host.py
 ```

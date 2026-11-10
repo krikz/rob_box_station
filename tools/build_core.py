@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""Бандл ядра диалога для колонки из КОММИТА ``krikz/rob_box_project`` (#4547 в rob_box_project).
+"""Бандл ядра диалога для колонки из ТЕГА ``krikz/rob_box_dialog_core`` (ADR-0167 Ш3, #4547 в rob_box_project).
 
-До 09.11 ядро на колонке было снимком рабочего дерева Windows-чекаута (CRLF, файлы разных служебных коммитов) —
-повторить его нельзя, а ``install.sh`` ядро не ставил вовсе: на чистой колонке падал шаг ключей. Теперь ядро —
-ассет релиза ``station-core.tar.gz`` (``rbx/core/…``), собранный этим скриптом из коммита ``tools/core_ref.txt``:
+Ядро версионируется тегами в своём репозитории; ``tools/core_ref.txt`` хранит тег (до Ш3 — монорепо-коммит
+``krikz/rob_box_project``, оттуда больше не собираем). Ассет релиза ``station-core.tar.gz`` (``rbx/core/…``)
+собирается этим скриптом из чекаута core-репозитория:
 
-    python -I tools/build_core.py ../rob_box_project station-core.tar.gz          # ref из tools/core_ref.txt
-    python -I tools/build_core.py ../rob_box_project out.tar.gz --ref origin/develop
+    python -I tools/build_core.py ../rob_box_dialog_core station-core.tar.gz          # ref из tools/core_ref.txt
+    python -I tools/build_core.py ../rob_box_dialog_core out.tar.gz --ref v0.7.2
 
-Файлы берутся ``git archive`` из коммита (ровно то, что в истории, LF), по списку ``tools/core_manifest.txt``:
+Файлы берутся ``git archive`` из тега (ровно то, что в истории, LF), по списку ``tools/core_manifest.txt``:
 каталог — целиком, кроме тестов и кэша; файл — как есть. В архив кладётся ``rbx/core/SOURCE`` (репозиторий, ref,
 полный хэш) — по нему видно, из чего собрано ядро на колонке. ``.env`` в архиве нет и быть не может.
+
+ВНИМАНИЕ (связанные правки хоста, без них колонка на v0.7.2 не поднимется): в ядре больше нет ``rob_box_voice``
+— STT MiniMax хост берёт из ``rob_box_llm.stt_providers`` (тот же интерфейс), а стенд после c81309c17 в
+rob_box_project системный промпт строит из данных пакета, контракт ``PROMPT_DIR`` выпилен.
 """
 from __future__ import annotations
 
@@ -69,7 +73,7 @@ def build(repo: Path, out: Path, ref: str, entries: list) -> dict:
             _add(dst, PREFIX + member.name, data, stamp)
             digest.update(member.name.encode() + b"\0" + data)
             count, size = count + 1, size + len(data)
-        source = (f"repo krikz/rob_box_project\nref {ref}\ncommit {sha}\nfiles {count}\n"
+        source = (f"repo krikz/rob_box_dialog_core\nref {ref}\ncommit {sha}\nfiles {count}\n"
                   f"content_sha256 {digest.hexdigest()}\n")
         _add(dst, PREFIX + "SOURCE", source.encode(), stamp)
     return {"commit": sha, "files": count, "bytes": size, "archive": out.stat().st_size,
@@ -85,15 +89,15 @@ def _add(tar: tarfile.TarFile, name: str, data: bytes, mtime: int) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("repo", type=Path, help="чекаут krikz/rob_box_project (нужна история с нужным коммитом)")
+    ap.add_argument("repo", type=Path, help="чекаут krikz/rob_box_dialog_core (нужен тег из tools/core_ref.txt)")
     ap.add_argument("out", type=Path)
-    ap.add_argument("--ref", default="", help=f"коммит/ветка/тег; по умолчанию — {REF_FILE.name}")
+    ap.add_argument("--ref", default="", help=f"тег/коммит; по умолчанию — {REF_FILE.name}")
     args = ap.parse_args()
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")  # консоль Windows — cp1252
     ref = args.ref or REF_FILE.read_text(encoding="utf-8").split()[0]
     info = build(args.repo, args.out, ref, manifest())
-    print(f"ядро: коммит {info['commit'][:12]}, файлов {info['files']}, {info['bytes'] / 2**20:.2f} МБ → "
+    print(f"ядро: тег {ref}, коммит {info['commit'][:12]}, файлов {info['files']}, {info['bytes'] / 2**20:.2f} МБ → "
           f"{args.out} {info['archive'] / 2**20:.2f} МБ, содержимое sha256 {info['content_sha256'][:16]}")
     return 0
 

@@ -31,15 +31,15 @@ def _updater(tmp_path, monkeypatch, raw: bytes):
 def test_install_places_scripts_keeps_prev_and_user_files(tmp_path, monkeypatch):
     (tmp_path / "station_host.py").write_text("old", encoding="utf-8")
     (tmp_path / "prompts").mkdir()
-    (tmp_path / "prompts" / "master_prompt_compact.txt").write_text("мой промпт", encoding="utf-8")
+    (tmp_path / "prompts" / "persona.txt").write_text("моя персона", encoding="utf-8")
     raw = _tarball({"scripts/station_host.py": b"new", "assets/heard.raw": b"\x00\x01",
-                    "prompts/master_prompt_compact.txt": b"repo prompt", "README.md": b"x"})
+                    "prompts/persona.txt": b"repo persona", "README.md": b"x"})
     up = _updater(tmp_path, monkeypatch, raw)
     up.install("v0.2.0")
     assert (tmp_path / "station_host.py").read_text(encoding="utf-8") == "new"
     assert (tmp_path / "prev" / "station_host.py").read_text(encoding="utf-8") == "old"
     assert (tmp_path / "assets" / "heard.raw").read_bytes() == b"\x00\x01"
-    assert (tmp_path / "prompts" / "master_prompt_compact.txt").read_text(encoding="utf-8") == "мой промпт"
+    assert (tmp_path / "prompts" / "persona.txt").read_text(encoding="utf-8") == "моя персона"
     assert not (tmp_path / "README.md").exists()
     assert up.current() == "v0.2.0"
 
