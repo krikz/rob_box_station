@@ -40,7 +40,10 @@ except (OSError, ValueError):
     pass
 for sub in ("site", "core", "core/scripts/dialog", "core/scripts/dialogue"):
     sys.path.insert(0, str(BASE / sub))
-for pkg in ("rob_box_core", "rob_box_dialog", "rob_box_harness", "rob_box_llm", "rob_box_voice", "rob_box_mcp_tools"):
+# rob_box_voice в ядре v0.7.2 нет (ADR-0167 Ш3): STT MiniMax — rob_box_llm.stt_providers; rob_box_dialog_host —
+# порт цепочки v2, его тянет сухой стенд (dialog_v2_ports).
+for pkg in ("rob_box_core", "rob_box_dialog", "rob_box_dialog_host", "rob_box_harness", "rob_box_llm",
+            "rob_box_mcp_tools"):
     sys.path.insert(0, str(CORE / "src" / pkg))
 
 import station_kws  # noqa: E402  (живые примеры вейка и промахи облака)
@@ -903,21 +906,37 @@ def widen_window(stand) -> None:
 
 def make_stand(args: argparse.Namespace):
     import chat  # noqa: PLC0415
+    import dry_stand  # noqa: PLC0415  (LiveClock — как у консоли)
 
     import station_setup as setup  # noqa: PLC0415
 
     install_llm_hedge()
     prompts = station_prompts(setup)
-    chat.dm.PROMPT_DIR = prompts.materialize(Path(args.workdir) / "prompt", device_facts())  # основа + дополнение
-    log(f"промпт: основа {'своя' if prompts.is_own() else 'ядра'}"
+    # Профиль продукта колонки (формат ядра 4): его читает сухой стенд (robot_prompt/robot_owners ядра v0.7.2).
+    profile = prompts.write_profile(CORE / "docker" / "sound" / "config", WAKE_WORDS)
+    from rob_box_dialog.profile import load_profile  # noqa: PLC0415
+    load_profile(profile)  # битый профиль — честная ошибка на старте, а не молча безымянная колонка
+    if (BASE / "prompts" / "master_prompt_compact.txt").exists():
+        log("⚠ prompts/master_prompt_compact.txt ядром v0.7.2 не читается — перенеси персону в persona.txt (страница)")
+    log(f"промпт: персона {'своя' if prompts.is_own() else 'заводская колонки'}"
         f"{', дополнение ' + str(len(prompts.extra().strip())) + ' знаков' if prompts.extra().strip() else ''}")
     t0 = time.time()
     register_report_tool()  # до сборки стенда: срез тулов не должен успеть закэшироваться без него
     if os.environ.get("RBX_HFP", "1").strip().lower() not in ("0", "off", "false", "no"):
         register_tool(PHONE_TOOL, PHONE_TOOL_DESCRIPTION, PHONE_TOOL_PARAMETERS)
-    cargs = chat.build_arg_parser().parse_args(["--wake-word"] + (["--db", args.db] if args.db else []))
-    stand = chat.build_stand(cargs, Path(args.workdir))
-    stand.wake = list(WAKE_WORDS)  # таблица вейков робота (wake_words.yaml) колонке не подходит
+    # Как chat.build_stand, но с нашей правкой системного промпта (дополнение + факты устройства): у консоли шов
+    # system_patch, PROMPT_DIR в ядре v0.7.2 выпилен.
+    providers = [p for p in os.environ.get("ROBBOX_LLM_PROVIDERS", "deepseek").split(",") if p.strip()]
+    memory = Path(args.db).expanduser().resolve() if args.db else None
+    try:
+        stand = chat.dm.build_real_stand(providers, Path(args.workdir), None, variant="A", memory_path=memory,
+                                         clock=dry_stand.LiveClock(),
+                                         system_patch=prompts.system_patch(device_facts()), role_voices=True)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    except RuntimeError as exc:
+        raise SystemExit(f"{exc}\nПроверь ключи в {CORE / 'scripts' / 'dialogue' / '.env'}.") from exc
+    stand.wake = list(WAKE_WORDS)  # вейк из профиля колонки; поле стенда — для цепочки понимания
     widen_window(stand)
     install_station_tools(stand)
     import station_report  # noqa: PLC0415  (жалоба в GitHub: «пожалуйся» → issue с логом)
@@ -1785,8 +1804,8 @@ async def serve_setup_only() -> None:
 
 
 def station_prompts(setup):
-    """Промпт колонки: свои копии в ``BASE/prompts``, основа ядра — в его ``rob_box_voice/prompts``."""
-    return setup.Prompts(CORE / "src" / "rob_box_voice" / "prompts", BASE / "prompts")
+    """Промпт колонки: свои копии в ``BASE/prompts`` (persona.txt, station_extra.txt); заводская персона — в коде."""
+    return setup.Prompts(BASE / "prompts")
 
 
 #: Абсолютный путь хоста: ``main`` уходит в каталог ядра (``os.chdir(CORE)``), и относительный ``sys.argv[0]`` после

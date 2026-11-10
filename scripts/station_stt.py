@@ -116,7 +116,7 @@ class YandexSTT:
 
 
 class MiniMaxSTT:
-    """Обёртка провайдера ядра (``rob_box_voice.stt_providers.minimax_provider``) под общий интерфейс цепочки."""
+    """Обёртка провайдера ядра (``rob_box_llm.stt_providers.minimax_provider``) под общий интерфейс цепочки."""
 
     name = "minimax"
 
@@ -126,14 +126,14 @@ class MiniMaxSTT:
     @classmethod
     def maybe_from_env(cls) -> Optional["MiniMaxSTT"]:
         try:
-            from rob_box_voice.stt_providers.minimax_provider import MiniMaxSTTProvider  # noqa: PLC0415
+            from rob_box_llm.stt_providers.minimax_provider import MiniMaxSTTProvider  # noqa: PLC0415
         except ImportError:
             return None
         provider = MiniMaxSTTProvider.maybe_from_env()
         return cls(provider) if provider is not None else None
 
     def recognize(self, pcm: bytes) -> str:
-        from rob_box_voice.stt_providers import minimax_provider as mm  # noqa: PLC0415
+        from rob_box_llm.stt_providers import minimax_provider as mm  # noqa: PLC0415
 
         wav = pcm if pcm[:4] == b"RIFF" else mm.ensure_wav_container(pcm, sample_rate=RATE)
         try:

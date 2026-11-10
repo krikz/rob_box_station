@@ -101,31 +101,43 @@ def test_page_never_shows_full_keys():
 
 
 def test_prompts_own_copy_and_reset(tmp_path):
-    core, own = tmp_path / "core", tmp_path / "own"
-    core.mkdir()
-    (core / ss.Prompts.FILE).write_text("You are РОББОКС.\n", encoding="utf-8")
-    p = ss.Prompts(core, own)
-    assert p.base() == "You are РОББОКС.\n" and not p.is_own()
-    p.save("You are Игорёк.\r\n", "Говори коротко.", reset=False)
-    assert p.is_own() and p.base() == "You are Игорёк.\n"
-    assert p.effective().endswith("Говори коротко.\n") and "Игорёк" in p.effective()
-    assert (p.materialize(tmp_path / "out") / ss.Prompts.FILE).read_text(encoding="utf-8") == p.effective()
+    p = ss.Prompts(tmp_path / "own", default_persona="You are Игорёк.\n\nХарактер.\n")
+    assert p.persona() == "You are Игорёк.\n\nХарактер.\n" and not p.is_own()
+    p.save("You are Колян.\r\n\r\nБолтливый.\r\n", "Говори коротко.", reset=False)
+    assert p.is_own() and p.persona() == "You are Колян.\n\nБолтливый.\n"
+    assert p.extra() == "Говори коротко."
+    patched = p.system_patch(facts="- IP: 10.1.1.13.\n")("SYSTEM")
+    assert patched.startswith("SYSTEM") and "STATION" in patched and "Говори коротко." in patched
+    assert "DEVICE FACTS" in patched and "10.1.1.13" in patched
     p.save("anything", "", reset=True)
-    assert not p.is_own() and p.effective() == "You are РОББОКС.\n"
+    assert not p.is_own() and p.persona() == "You are Игорёк.\n\nХарактер.\n"
 
 
-def test_prompt_equal_to_core_keeps_no_copy(tmp_path):
-    core = tmp_path / "core"
-    core.mkdir()
-    (core / ss.Prompts.FILE).write_text("base\n", encoding="utf-8")
-    p = ss.Prompts(core, tmp_path / "own")
-    p.save("base\n", "", reset=False)
+def test_prompt_equal_to_factory_keeps_no_copy(tmp_path):
+    p = ss.Prompts(tmp_path / "own", default_persona="base\n\ncharacter\n")
+    p.save("base\n\ncharacter\n", "", reset=False)
     assert not p.is_own()
 
 
-def test_empty_base_without_reset_is_refused(tmp_path):
+def test_empty_persona_without_reset_is_refused(tmp_path):
     with pytest.raises(ValueError):
-        ss.Prompts(tmp_path, tmp_path / "own").save("  ", "", reset=False)
+        ss.Prompts(tmp_path / "own").save("  ", "", reset=False)
+
+
+def test_write_profile_product_format(tmp_path):
+    """Профиль колонки — формат ядра 4: assistant.yaml + таблица вейков и персоны рядом; одноблочная персона — ошибка."""
+    p = ss.Prompts(tmp_path / "own")
+    profile = p.write_profile(tmp_path / "prof", ["игорёк", "игорек"])
+    assert profile.name == "assistant.yaml"
+    yaml_text = profile.read_text(encoding="utf-8")
+    assert "format: 4\n" in yaml_text and "name: Игорёк\n" in yaml_text
+    for owner in ("speech", "memory", "clock", "web", "battery", "perception"):
+        assert f"  - {owner}\n" in yaml_text
+    assert (tmp_path / "prof" / "wake_words.yaml").read_text(encoding="utf-8") == \
+        "personality:\n  - игорёк\n  - игорек\noperator: []\n"
+    assert "\n\n" in (tmp_path / "prof" / "persona.txt").read_text(encoding="utf-8")
+    with pytest.raises(ValueError):
+        ss.Prompts(tmp_path / "own2", default_persona="только один блок").write_profile(tmp_path / "prof2", [])
 
 
 def test_page_has_issue_token_but_no_update_token():
