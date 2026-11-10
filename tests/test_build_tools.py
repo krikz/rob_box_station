@@ -29,9 +29,9 @@ def test_wanted_filters_tests_cache_docs_env():
 def test_manifest_covers_what_host_imports():
     names = bc.manifest()
     assert "scripts/dialogue/chat.py" in names and "scripts/dialog/dry_stand.py" in names
-    assert "src/rob_box_voice/prompts/master_prompt_compact.txt" in names
+    # rob_box_voice с v0.7.2 в ядре нет (ADR-0167 Ш3): STT MiniMax — rob_box_llm.stt_providers.
     assert all(f"src/{p}/{p}/" in names for p in ("rob_box_core", "rob_box_dialog", "rob_box_harness", "rob_box_llm",
-                                                   "rob_box_voice", "rob_box_mcp_tools"))
+                                                   "rob_box_mcp_tools"))
 
 
 def _git(repo: Path, *args: str) -> None:

@@ -1,14 +1,14 @@
-# Что из krikz/rob_box_project входит в ядро колонки (tools/build_core.py). Каталог (с «/» в конце) — целиком,
-# кроме test/, tests/, __pycache__, *.md; файл — как есть. Список снят с ядра на 10.1.1.13 09.11 (291 файл):
-# пакеты целиком, чтобы новый импорт в ядре не ронял колонку из-за забытого файла.
+# Что из krikz/rob_box_dialog_core входит в ядро колонки (tools/build_core.py). Каталог (с «/» в конце) — целиком,
+# кроме test/, tests/, __pycache__, *.md; файл — как есть. Тег задаётся в tools/core_ref.txt (ADR-0167 Ш3, #4547
+# в rob_box_project). С v0.7.2 в ядре нет rob_box_voice: MiniMax STT — rob_box_llm/stt_providers/, основа промпта —
+# данные пакета rob_box_dialog.prompts, миграции — внутри rob_box_core.migrations. Хост колонки правится в связке
+# (station_stt.py → rob_box_llm.stt_providers; промпт без PROMPT_DIR), см. предупреждение в tools/build_core.py.
 src/rob_box_core/rob_box_core/
 src/rob_box_dialog/rob_box_dialog/
+src/rob_box_dialog_host/rob_box_dialog_host/
 src/rob_box_harness/rob_box_harness/
 src/rob_box_llm/rob_box_llm/
-src/rob_box_voice/rob_box_voice/
 src/rob_box_mcp_tools/rob_box_mcp_tools/
-# основа системного промпта ядра (страница настроек показывает её как «основу ядра»)
-src/rob_box_voice/prompts/master_prompt_compact.txt
 # стенд консоли: на нём хост собирает ход (chat.build_stand)
 scripts/dialogue/chat.py
 scripts/dialog/dry_stand.py
@@ -18,6 +18,4 @@ scripts/dialog/env_files.py
 scripts/dialog/speech_format.py
 scripts/dialog/speech_text.py
 scripts/dialog/understanding_variants.py
-scripts/ci/e2e/e2e_tool_match.py
-docker/sound/config/wake_words.yaml
-migrations/
+scripts/dialog/e2e_tool_match.py
