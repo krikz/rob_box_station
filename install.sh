@@ -112,8 +112,9 @@ run "$SSHN 'E=$RBX/core/scripts/dialogue/.env; [ -f \$E ] || { printf \"DEEPSEEK
 say "автозапуск, глушение Алисы, приветствие SSH (системная часть: remount rw → ro)"
 run "cd '$TMP/scripts' && tar cf - S99zzyandexoff S99zzzrbxhost | $SSH 'mount -o remount,rw / && cd /etc/init.d && tar xf - && chmod +x S99zzyandexoff S99zzzrbxhost && printf \"[ -f $RBX/motd.sh ] && . $RBX/motd.sh\\n\" > /etc/profile.d/rbx.sh && sync; mount -o remount,ro /'"
 # глушение — в переднем плане (~30 с) и с проверкой: фон из ssh-сессии умирал вместе с ней, Алиса оставалась жива,
-# микрофон был занят (#4551 в rob_box_project); не заглушилась — второй заход
-run "$SSHN 'touch /data/opt/yandex_off /data/opt/rbx_host && (/etc/init.d/S99zzyandexoff now || /etc/init.d/S99zzyandexoff now) && DELAY=0 /etc/init.d/S99zzzrbxhost restart'"
+# микрофон был занят (#4551 в rob_box_project); не заглушилась — второй заход.
+# хост после рестарта стартует фоновый цикл — тот же потомок ssh-сессии: запускаем через setsid, чтобы пережил SIGHUP
+run "$SSHN 'touch /data/opt/yandex_off /data/opt/rbx_host && (/etc/init.d/S99zzyandexoff now || /etc/init.d/S99zzyandexoff now) && DELAY=0 setsid /etc/init.d/S99zzzrbxhost restart </dev/null >/dev/null 2>&1'"
 
 say "готово. Открой http://$HOST:8080 — впиши ключи (DeepSeek, MiniMax), нажми любую кнопку колонки, «Сохранить»."
 say "Wi-Fi потом можно сменить там же или с телефона по Bluetooth (Chrome → improv-wifi.com). Обновления: «Игорёк, обновись»."
