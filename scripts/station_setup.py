@@ -254,9 +254,9 @@ DEFAULT_OPERATOR_PERSONA = """You are the operator agent of this speaker.
 """
 
 #: Владельцы тулов колонки (порты ``rob_box_dialog.owners``): только то, что колонка честно исполняет (хендлеры в
-#: ``install_station_tools``); музыка, лицо, звуки, движение, камера у колонки нет — модель этих тулов не видит
-#: вовсе (честнее, чем отказ вызовом, — 07.11 колонка отвечала «заряд 87 %» за то, чего у неё нет, ADR-0167 §2.4).
-PROFILE_OWNERS = ("speech", "memory", "clock", "web", "battery", "perception")
+#: ``install_station_tools``). Движение, лицо и камера у колонки нет — их портов нет в срезе, модель этих тулов не
+#: видит вовсе (ADR-0160 §8 К3; честнее отказа вызовом — 07.11 колонка отвечала «никого в кадре», ADR-0167 §2.4).
+PROFILE_OWNERS = ("speech", "memory", "clock", "web", "battery")
 
 
 class Prompts:
