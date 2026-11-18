@@ -139,6 +139,25 @@ def test_wordless_turn_arms_window_without_wake():
     assert buttons.armed_with is ring and ring.states == ["listen"]
 
 
+#: Тулы движения, лица и камеры (ADR-0160 §8 К3) — хост колонки их не ставит.
+MOTION_FACE_CAMERA_TOOLS = (
+    "get_perception_context", "play_animation",
+    "people_list", "person_photo", "name_person", "find_similar", "merge_people",
+    "navigate_to_waypoint", "navigate_to_coordinates", "move_direction", "stop_navigation",
+    "get_current_pose", "list_waypoints", "save_waypoint", "delete_waypoint", "clear_waypoints",
+    "start_mapping", "continue_mapping", "finish_mapping", "optimize_map", "load_map",
+    "list_maps", "delete_map",
+)
+
+
+def test_station_tools_omit_motion_face_camera():
+    """Срез колонки: обработчиков движения, лица и камеры нет — модель их не вызывает."""
+    stand = types.SimpleNamespace(tools=types.SimpleNamespace())
+    sh.install_station_tools(stand)
+    have = {name[3:] for name in vars(stand.tools) if name.startswith("_t_")}
+    assert not have & set(MOTION_FACE_CAMERA_TOOLS)
+
+
 def test_device_facts_tell_model_it_can_report(monkeypatch):
     monkeypatch.setattr(sh, "wifi_now", lambda: {"ssid": "net", "ip": "10.1.1.13"})
     facts = sh.device_facts()

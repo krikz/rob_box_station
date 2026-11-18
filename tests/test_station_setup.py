@@ -7,6 +7,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import station_setup as ss  # noqa: E402
 
+#: Порты ядра движения, лица и камеры (ADR-0160 §8 К3) — в срезе колонки их нет.
+MOTION_FACE_CAMERA_OWNERS = ("navigation", "mapping", "face", "people", "perception")
+
 
 def _rpc(command: int, data: bytes) -> bytes:
     packet = bytes([command, len(data)]) + data
@@ -124,6 +127,12 @@ def test_empty_persona_without_reset_is_refused(tmp_path):
         ss.Prompts(tmp_path / "own").save("  ", "", reset=False)
 
 
+def test_profile_owners_omit_motion_face_camera():
+    """ADR-0160 §8 К3: срез колонки — без движения, лица и камеры; новых владельцев не добавляем."""
+    assert ss.PROFILE_OWNERS == ("speech", "memory", "clock", "web", "battery")
+    assert not set(MOTION_FACE_CAMERA_OWNERS) & set(ss.PROFILE_OWNERS)
+
+
 def test_write_profile_product_format(tmp_path):
     """Профиль колонки — формат ядра 4: assistant.yaml + таблица вейков и персоны рядом; одноблочная персона — ошибка."""
     p = ss.Prompts(tmp_path / "own")
@@ -131,8 +140,10 @@ def test_write_profile_product_format(tmp_path):
     assert profile.name == "assistant.yaml"
     yaml_text = profile.read_text(encoding="utf-8")
     assert "format: 4\n" in yaml_text and "name: Игорёк\n" in yaml_text
-    for owner in ("speech", "memory", "clock", "web", "battery", "perception"):
+    for owner in ss.PROFILE_OWNERS:
         assert f"  - {owner}\n" in yaml_text
+    for owner in MOTION_FACE_CAMERA_OWNERS:
+        assert f"  - {owner}\n" not in yaml_text
     assert (tmp_path / "prof" / "wake_words.yaml").read_text(encoding="utf-8") == \
         "personality:\n  - игорёк\n  - игорек\noperator: []\n"
     assert "\n\n" in (tmp_path / "prof" / "persona.txt").read_text(encoding="utf-8")

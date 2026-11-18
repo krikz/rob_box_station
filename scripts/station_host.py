@@ -738,9 +738,6 @@ def install_station_tools(stand) -> None:
     def battery(args: dict) -> tuple:
         return True, {"status": "no_battery", "battery_level": None, "power": "колонка работает от сети, батареи нет"}
 
-    def perception(args: dict) -> tuple:
-        return False, {"status": "rejected", "reason": "unavailable", "detail": "у колонки нет камеры"}
-
     def volume(args: dict) -> tuple:
         """Громкость голоса — настоящая (``amixer``), как кнопки; проценты — по шкале кнопок."""
         old = STATION_STATE["volume"]
@@ -763,12 +760,12 @@ def install_station_tools(stand) -> None:
         return handler
 
     tools._t_get_robot_status, tools._t_get_battery_level = status, battery
-    tools._t_get_perception_context = perception
     tools._t_set_volume = volume
     tools._t_search_web = web_search
-    # Заглушки стенда консоли рапортуют «готово» за то, чего у колонки нет (музыка, лицо, звуки) — честный отказ.
+    # Заглушки стенда консоли рапортуют «готово» за то, чего у колонки нет (музыка, звуки) — честный отказ.
+    # Движение, лицо и камера в срез не входят (PROFILE_OWNERS, ADR-0160 §8 К3) — обработчиков нет.
     for name, what in (("request_music", "музыки"), ("generate_music", "музыки"), ("music_library", "музыки"),
-                       ("dj_set", "музыки"), ("set_music_volume", "музыки"), ("play_animation", "лица и анимаций"),
+                       ("dj_set", "музыки"), ("set_music_volume", "музыки"),
                        ("play_sound", "библиотеки звуков"), ("get_sound_info", "библиотеки звуков")):
         setattr(tools, f"_t_{name}", unavailable(what))
 
