@@ -105,7 +105,7 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 say "код колонки $TAG"
 curl -sL "https://codeload.github.com/$REPO/tar.gz/refs/tags/$TAG" | (cd "$TMP" && tar xzf - --strip-components=1)
-run "cd '$TMP/scripts' && tar cf - *.py motd.sh | $SSH 'mkdir -p $RBX && cd $RBX && tar xf - && echo $TAG > VERSION'"
+run "cd '$TMP/scripts' && { set -- *.py motd.sh; [ ! -f core_ref.txt ] || set -- \"\$@\" core_ref.txt; tar cf - \"\$@\"; } | $SSH 'mkdir -p $RBX && cd $RBX && tar xf - && echo $TAG > VERSION'"
 run "cd '$TMP' && tar cf - assets prompts | $SSH 'cd /tmp && rm -rf rbxnew && mkdir rbxnew && cd rbxnew && tar xf - && cp -a assets $RBX/ && mkdir -p $RBX/prompts && for f in prompts/*; do [ -f $RBX/\$f ] || cp \$f $RBX/\$f; done; cd /tmp && rm -rf rbxnew'"
 run "$SSHN 'E=$RBX/core/scripts/dialogue/.env; [ -f \$E ] || { printf \"DEEPSEEK_API_KEY=\\nMINIMAX_API_KEY=\\nMINIMAX_GROUP_ID=\\n\" > \$E; chmod 600 \$E; }'"
 

@@ -1,5 +1,7 @@
 """Обновление колонки: установка из архива тега, prev/ для отката, проверка места (без сети и без сторожа)."""
+import hashlib
 import io
+import json
 import sys
 import tarfile
 import urllib.error
@@ -11,11 +13,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import station_update as su  # noqa: E402
 
 
-def _tarball(files: dict) -> bytes:
+def _tarball(files: dict, prefix: str = "krikz-rob_box_station-abc123") -> bytes:
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for name, data in files.items():
-            info = tarfile.TarInfo(f"krikz-rob_box_station-abc123/{name}")
+            info = tarfile.TarInfo(f"{prefix}/{name}")
             info.size = len(data)
             tar.addfile(info, io.BytesIO(data))
     return buf.getvalue()
@@ -127,3 +129,100 @@ def test_update_command_words():
     assert su.update_command("есть ли обновления") == "check"
     assert su.update_command("обновись") == "install"
     assert su.update_command("обнови прогноз погоды") == ""
+
+
+def _core_upgrade(tmp_path, monkeypatch, archive_ref="v0.7.8", digest=None):
+    (tmp_path / "VERSION").write_text("v0.2.3\n", encoding="utf-8")
+    (tmp_path / "core_ref.txt").write_text("v0.7.8\n", encoding="utf-8")
+    core = tmp_path / "core"
+    env = core / "scripts/dialogue/.env"
+    env.parent.mkdir(parents=True)
+    env.write_bytes(b"EXAMPLE=local-test-value\n")
+    (core / "SOURCE").write_text("ref v0.7.2\n", encoding="utf-8")
+    (core / "old-only").write_bytes(b"old")
+    raw = _tarball({"core/SOURCE": f"ref {archive_ref}\n".encode(),
+                    "core/scripts/dialogue/chat.py": b"# bundled chat"}, prefix="rbx")
+    metadata = {"assets": [{"name": "station-core.tar.gz", "id": 123,
+                            "digest": "sha256:" + (digest or hashlib.sha256(raw).hexdigest())}]}
+    requests = []
+
+    def get(url, token, accept=""):
+        requests.append(url.rsplit("/", 1)[-1])
+        return json.dumps(metadata).encode() if url.endswith("/releases/tags/v0.2.3") else raw
+
+    monkeypatch.setattr(su, "_get", get)
+    return su.Updater(tmp_path, lambda: "token", lambda msg: None), env, requests
+
+
+def test_boot_syncs_core_from_current_release_after_legacy_update(tmp_path, monkeypatch):
+    up, env, requests = _core_upgrade(tmp_path, monkeypatch)
+    assert up.sync_core()
+    assert (tmp_path / "core/SOURCE").read_text(encoding="utf-8") == "ref v0.7.8\n"
+    assert env.read_bytes() == b"EXAMPLE=local-test-value\n"
+    assert not (tmp_path / "core/old-only").exists()
+    assert not up.sync_core()
+    assert requests == ["v0.2.3", "123"]
+
+
+@pytest.mark.parametrize("archive_ref,digest", [("v0.7.2", None), ("v0.7.8", "0" * 64)])
+def test_bad_release_core_leaves_current_core_intact(tmp_path, monkeypatch, archive_ref, digest):
+    up, env, _ = _core_upgrade(tmp_path, monkeypatch, archive_ref, digest)
+    with pytest.raises(ValueError):
+        up.sync_core()
+    assert (tmp_path / "core/SOURCE").read_text(encoding="utf-8") == "ref v0.7.2\n"
+    assert env.is_file()
+    assert (tmp_path / "core/old-only").is_file()
+
+
+def test_core_rollback_restores_previous_tree_without_network(tmp_path, monkeypatch):
+    up, env, requests = _core_upgrade(tmp_path, monkeypatch)
+    up.sync_core()
+    (tmp_path / "core_ref.txt").write_text("v0.7.2\n", encoding="utf-8")
+    assert up.sync_core()
+    assert (tmp_path / "core/old-only").read_bytes() == b"old"
+    assert not (tmp_path / "core/scripts/dialogue/chat.py").exists()
+    assert env.is_file()
+    assert requests == ["v0.2.3", "123"]
+
+
+def test_latest_waits_for_published_core_asset(tmp_path, monkeypatch):
+    (tmp_path / "VERSION").write_text("v0.2.2", encoding="utf-8")
+    asset = {"name": "station-core.tar.gz", "state": "uploaded", "digest": "sha256:" + "0" * 64}
+    releases = [
+        {"tag_name": "v0.2.5", "draft": True, "assets": [asset]},
+        {"tag_name": "v0.2.4", "prerelease": True, "assets": [asset]},
+        {"tag_name": "v0.2.3", "assets": []},
+        {"tag_name": "v0.2.2", "assets": [asset]},
+    ]
+
+    def get(url, token, accept=""):
+        assert url.endswith("/releases?per_page=20")
+        return json.dumps(releases).encode()
+
+    monkeypatch.setattr(su, "_get", get)
+    monkeypatch.setattr(su.Updater, "notes", lambda self, tag: "")
+    up = su.Updater(tmp_path, lambda: "", lambda msg: None)
+    assert up.latest()[0] is None
+
+    releases[2]["assets"] = [asset]
+    assert up.latest()[0] == "v0.2.3"
+
+
+def test_slow_core_download_leaves_current_core_for_legacy_watchdog(tmp_path, monkeypatch):
+    up, env, _ = _core_upgrade(tmp_path, monkeypatch)
+    now = iter((0.0, 100.0))
+    monkeypatch.setattr(su, "monotonic", lambda: next(now), raising=False)
+    with pytest.raises(TimeoutError):
+        up.sync_core()
+    assert (tmp_path / "core/SOURCE").read_text(encoding="utf-8") == "ref v0.7.2\n"
+    assert env.is_file()
+
+
+def test_boot_recovers_old_core_if_interrupted_between_renames(tmp_path, monkeypatch):
+    up, env, requests = _core_upgrade(tmp_path, monkeypatch)
+    (tmp_path / "core").rename(tmp_path / "core.prev")
+    (tmp_path / "core_ref.txt").write_text("v0.7.2\n", encoding="utf-8")
+    assert not up.sync_core()
+    assert (tmp_path / "core/old-only").read_bytes() == b"old"
+    assert env.is_file()
+    assert not requests

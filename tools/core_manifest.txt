@@ -1,5 +1,5 @@
 # Что из krikz/rob_box_dialog_core входит в ядро колонки (tools/build_core.py). Каталог (с «/» в конце) — целиком,
-# кроме test/, tests/, __pycache__, *.md; файл — как есть. Тег задаётся в tools/core_ref.txt (ADR-0167 Ш3, #4547
+# кроме test/, tests/, __pycache__, *.md; файл — как есть. Тег задаётся в scripts/core_ref.txt (ADR-0167 Ш3, #4547
 # в rob_box_project). С v0.7.2 в ядре нет rob_box_voice: MiniMax STT — rob_box_llm/stt_providers/, основа промпта —
 # данные пакета rob_box_dialog.prompts, миграции — внутри rob_box_core.migrations. Хост колонки правится в связке
 # (station_stt.py → rob_box_llm.stt_providers; промпт без PROMPT_DIR), см. предупреждение в tools/build_core.py.

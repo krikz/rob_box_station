@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Бандл ядра диалога для колонки из ТЕГА ``krikz/rob_box_dialog_core`` (ADR-0167 Ш3, #4547 в rob_box_project).
 
-Ядро версионируется тегами в своём репозитории; ``tools/core_ref.txt`` хранит тег (до Ш3 — монорепо-коммит
+Ядро версионируется тегами в своём репозитории; ``scripts/core_ref.txt`` хранит тег (до Ш3 — монорепо-коммит
 ``krikz/rob_box_project``, оттуда больше не собираем). Ассет релиза ``station-core.tar.gz`` (``rbx/core/…``)
 собирается этим скриптом из чекаута core-репозитория:
 
-    python -I tools/build_core.py ../rob_box_dialog_core station-core.tar.gz          # ref из tools/core_ref.txt
+    python -I tools/build_core.py ../rob_box_dialog_core station-core.tar.gz          # ref из scripts/core_ref.txt
     python -I tools/build_core.py ../rob_box_dialog_core out.tar.gz --ref v0.7.2
 
 Файлы берутся ``git archive`` из тега (ровно то, что в истории, LF), по списку ``tools/core_manifest.txt``:
@@ -30,7 +30,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 MANIFEST = HERE / "core_manifest.txt"
-REF_FILE = HERE / "core_ref.txt"
+REF_FILE = HERE.parent / "scripts" / "core_ref.txt"
 PREFIX = "rbx/core/"
 #: Что из каталогов пакетов не нужно колонке: тесты, кэш, документация.
 SKIP_PARTS = {"test", "tests", "__pycache__"}
@@ -89,7 +89,7 @@ def _add(tar: tarfile.TarFile, name: str, data: bytes, mtime: int) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("repo", type=Path, help="чекаут krikz/rob_box_dialog_core (нужен тег из tools/core_ref.txt)")
+    ap.add_argument("repo", type=Path, help="чекаут krikz/rob_box_dialog_core (нужен тег из scripts/core_ref.txt)")
     ap.add_argument("out", type=Path)
     ap.add_argument("--ref", default="", help=f"тег/коммит; по умолчанию — {REF_FILE.name}")
     args = ap.parse_args()
