@@ -763,7 +763,8 @@ def install_station_tools(stand) -> None:
     tools._t_set_volume = volume
     tools._t_search_web = web_search
     # Заглушки стенда консоли рапортуют «готово» за то, чего у колонки нет (музыка, звуки) — честный отказ.
-    # Движение, лицо и камера в срез не входят (PROFILE_OWNERS, ADR-0160 §8 К3) — обработчиков нет.
+    # PROFILE_OWNERS скрывает лицо и камеру, а None отключает унаследованные заглушки FakeTools.
+    tools._t_get_perception_context = tools._t_play_animation = None
     for name, what in (("request_music", "музыки"), ("generate_music", "музыки"), ("music_library", "музыки"),
                        ("dj_set", "музыки"), ("set_music_volume", "музыки"),
                        ("play_sound", "библиотеки звуков"), ("get_sound_info", "библиотеки звуков")):

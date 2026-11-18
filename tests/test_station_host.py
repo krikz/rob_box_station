@@ -150,12 +150,19 @@ MOTION_FACE_CAMERA_TOOLS = (
 )
 
 
-def test_station_tools_omit_motion_face_camera():
-    """Срез колонки: обработчиков движения, лица и камеры нет — модель их не вызывает."""
-    stand = types.SimpleNamespace(tools=types.SimpleNamespace())
+def test_station_tools_omit_motion_face_camera() -> None:
+    """Хост отключает и унаследованные заглушки лица и камеры из DryStand."""
+
+    class ConsoleTools:
+        def _t_get_perception_context(self, args: dict) -> tuple:
+            return True, {"summary": "никого в кадре"}
+
+        def _t_play_animation(self, args: dict) -> tuple:
+            return True, {"status": "done"}
+
+    stand = types.SimpleNamespace(tools=ConsoleTools())
     sh.install_station_tools(stand)
-    have = {name[3:] for name in vars(stand.tools) if name.startswith("_t_")}
-    assert not have & set(MOTION_FACE_CAMERA_TOOLS)
+    assert not [name for name in MOTION_FACE_CAMERA_TOOLS if callable(getattr(stand.tools, f"_t_{name}", None))]
 
 
 def test_device_facts_tell_model_it_can_report(monkeypatch):
