@@ -915,7 +915,7 @@ def make_stand(args: argparse.Namespace):
     from rob_box_dialog.profile import load_profile  # noqa: PLC0415
     load_profile(profile)  # битый профиль — честная ошибка на старте, а не молча безымянная колонка
     if (BASE / "prompts" / "master_prompt_compact.txt").exists():
-        log("⚠ prompts/master_prompt_compact.txt ядром v0.7.2 не читается — перенеси персону в persona.txt (страница)")
+        log("⚠ prompts/master_prompt_compact.txt ядром не читается — перенеси персону в persona.txt (страница)")
     log(f"промпт: персона {'своя' if prompts.is_own() else 'заводская колонки'}"
         f"{', дополнение ' + str(len(prompts.extra().strip())) + ' знаков' if prompts.extra().strip() else ''}")
     t0 = time.time()
@@ -1831,6 +1831,27 @@ def main() -> int:
     ap.add_argument("--db", default="", help="постоянная e2e-память колонки")
     ap.add_argument("--workdir", default="/tmp/rbx_station", help="каталог стенда")
     args = ap.parse_args()
+    import station_setup  # noqa: PLC0415
+    import station_update  # noqa: PLC0415
+
+    def update_token() -> str:
+        env = station_setup.read_env(CORE / station_update.CORE_ENV)
+        return os.environ.get("GITHUB_TOKEN", env.get("GITHUB_TOKEN", "")).strip().strip("'\"")
+
+    updater = station_update.Updater(BASE, update_token, log)
+    changed = updater.sync_core()
+    if changed:
+        station_update.OK_MARK.unlink(missing_ok=True)
+    try:
+        return run_host(args)
+    except (Exception, SystemExit):
+        if changed and not station_update.OK_MARK.exists():
+            os.chdir(BASE)
+            updater.restore_core()
+        raise
+
+
+def run_host(args: argparse.Namespace) -> int:
     os.makedirs(args.workdir, exist_ok=True)
     os.chdir(CORE)
     load_env()

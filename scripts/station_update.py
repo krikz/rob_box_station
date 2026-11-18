@@ -9,22 +9,29 @@
 Порядок: старые файлы → ``prev/``, новые — на место, ``VERSION`` = тег, перезапуск хоста. Сторож (отдельный процесс,
 ``setsid``) взводится хостом **в момент перезапуска** (``arm_watchdog``) и через ``WATCH_S`` проверяет метку
 ``/tmp/rbx_update_ok`` (хост ставит её, когда слушает и прожил 30 с); нет метки — возвращает ``prev/`` и
-перезапускает хост. Ядро (``core/``) — пока отдельно (ADR-0167 Ш2).
+перезапускает хост. При старте сверяем ядро с пином тега и, если нужно, берём архив из релиза.
 """
+import hashlib
 import io
 import json
 import os
 import shutil
 import subprocess
 import tarfile
+import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from time import monotonic
 from typing import Callable, Optional, Tuple
 
 REPO = os.environ.get("RBX_UPDATE_REPO", "krikz/rob_box_station")
 OK_MARK = Path("/tmp/rbx_update_ok")
 WATCH_S = 90
+CORE_ASSET = "station-core.tar.gz"
+CORE_ENV = Path("scripts/dialogue/.env")
+CORE_STAGE_S = 30  # оставляем время на старт и 30 с проверки старому сторожу
 UPDATED = ("scripts/", "assets/")  # что берётся из релиза (scripts/*.py кладутся в корень установки)
 
 
@@ -48,9 +55,38 @@ def _read(url: str, headers: dict) -> bytes:
 
     import certifi  # noqa: PLC0415
 
-    req = urllib.request.Request(url, headers=headers)
+    req = urllib.request.Request(url, headers={k: v for k, v in headers.items() if k != "Authorization"})
+    if "Authorization" in headers:
+        req.add_unredirected_header("Authorization", headers["Authorization"])
     with urllib.request.urlopen(req, timeout=30, context=ssl.create_default_context(cafile=certifi.where())) as r:
         return r.read()
+
+
+def _core_ref(core: Path) -> str:
+    try:
+        lines = (core / "SOURCE").read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return ""
+    return next((line.removeprefix("ref ") for line in lines if line.startswith("ref ")), "")
+
+
+def _extract_core(raw: bytes, target: Path, ref: str) -> None:
+    """Распаковать только обычные файлы бандла в отдельный каталог."""
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tar:
+        members = tar.getmembers()
+        if shutil.disk_usage(target.parent).free < sum(m.size for m in members) + 2 * 2**20:
+            raise OSError("не хватает места для ядра")
+        for member in members:
+            rel = PurePosixPath(member.name)
+            if (not member.isfile() or rel.parts[:2] != ("rbx", "core") or len(rel.parts) < 3
+                    or ".." in rel.parts or "\\" in member.name or ":" in member.name or rel.name == ".env"):
+                raise ValueError(f"недопустимый файл ядра: {member.name}")
+            dest = target.joinpath(*rel.parts[2:])
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with tar.extractfile(member) as incoming, dest.open("xb") as out:
+                shutil.copyfileobj(incoming, out)
+    if _core_ref(target) != ref or not (target / "scripts/dialogue/chat.py").is_file():
+        raise ValueError(f"архив ядра не соответствует пину {ref}")
 
 
 class Updater:
@@ -63,11 +99,75 @@ class Updater:
         except OSError:
             return "без версии"
 
+    def sync_core(self) -> bool:
+        """На первом старте после OTA поставить ядро именно из релиза запущенного хоста."""
+        pin = self.base / "core_ref.txt"
+        if not pin.is_file():  # установленный вручную стенд без пина
+            return False
+        ref = pin.read_text(encoding="utf-8").strip()
+        if not ref:
+            raise ValueError("пустой пин ядра")
+        core, previous = self.base / "core", self.base / "core.prev"
+        if not core.exists() and _core_ref(previous):
+            previous.rename(core)  # прерывание между двумя rename
+        if _core_ref(core) == ref:
+            return False
+        if _core_ref(previous) == ref:
+            return self.restore_core()
+        began = monotonic()
+        version = self.current()
+        tag = urllib.parse.quote(version, safe="")
+        root = f"https://api.github.com/repos/{REPO}/releases"
+        token = self.token()
+        release = json.loads(_get(f"{root}/tags/{tag}", token))
+        asset = next((asset for asset in release["assets"] if asset["name"] == CORE_ASSET), None)
+        if asset is None:
+            raise ValueError(f"в релизе {tag} нет {CORE_ASSET}")
+        raw = _get(f"{root}/assets/{int(asset['id'])}", token, "application/octet-stream")
+        if asset.get("digest") != "sha256:" + hashlib.sha256(raw).hexdigest():
+            raise ValueError("SHA-256 архива ядра не совпадает с релизом")
+        with tempfile.TemporaryDirectory(prefix=".core-stage-", dir=self.base) as stage:
+            candidate = Path(stage) / "core"
+            _extract_core(raw, candidate, ref)
+            if monotonic() - began > CORE_STAGE_S or self.current() != version:
+                raise TimeoutError("окно обновления ядра истекло")
+            self._switch_core(candidate)
+        self.log(f"⬆ ядро диалога: {ref} из {tag}")
+        return True
+
+    def restore_core(self) -> bool:
+        previous = self.base / "core.prev"
+        if not _core_ref(previous):
+            return False
+        self._switch_core(previous)
+        self.log(f"⬆ ядро диалога: возвращено {_core_ref(self.base / 'core')}")
+        return True
+
+    def _switch_core(self, candidate: Path) -> None:
+        core, previous = self.base / "core", self.base / "core.prev"
+        env = (core if core.exists() else previous) / CORE_ENV
+        if env.is_file() and env != candidate / CORE_ENV:
+            shutil.copy2(env, candidate / CORE_ENV)
+        with tempfile.TemporaryDirectory(prefix=".core-swap-", dir=self.base) as scratch:
+            saved = Path(scratch) / "previous"
+            if previous.exists():
+                previous.rename(saved)
+            try:
+                if core.exists():
+                    core.rename(previous)
+                (saved if candidate == previous else candidate).rename(core)
+            except OSError:
+                if not core.exists() and previous.exists():
+                    previous.rename(core)
+                if saved.exists():
+                    saved.rename(previous)
+                raise
+
     def latest(self) -> Tuple[Optional[str], str]:
-        """(новый тег или None, фраза). Тег — последний по дате коммита среди тегов ``v*``."""
+        """(новый тег или None, фраза) для опубликованного релиза с загруженным ядром."""
         token = self.token()
         try:
-            tags = json.loads(_get(f"https://api.github.com/repos/{REPO}/tags?per_page=20", token))
+            releases = json.loads(_get(f"https://api.github.com/repos/{REPO}/releases?per_page=20", token))
         except Exception as exc:  # noqa: BLE001
             self.log(f"⬆ проверка обновления: {type(exc).__name__}: {exc}")
             if not token and "404" in str(exc):  # закрытый репо без токена GitHub отвечает 404
@@ -75,12 +175,20 @@ class Updater:
             if getattr(exc, "code", None) in (401, 403):
                 return None, "Гитхаб не принял токен: очисти поле с токеном или впиши рабочий."
             return None, "Не смог проверить обновление: гитхаб не ответил."
-        names = [t["name"] for t in tags if str(t.get("name", "")).startswith("v")]
+        names = [r["tag_name"] for r in releases
+                 if not (r.get("draft") or r.get("prerelease")) and r.get("tag_name", "").startswith("v")
+                 and any(a.get("name") == CORE_ASSET and a.get("state") == "uploaded" and a.get("digest")
+                         for a in r.get("assets", ()))]
         if not names:
-            return None, "Релизов пока нет."
-        newest = max(names, key=lambda n: [int(x) if x.isdigit() else 0 for x in n[1:].split(".")])
-        if newest == self.current():
-            return None, f"Обновлений нет, у меня последняя версия {newest}."
+            return None, "Опубликованных обновлений с ядром пока нет."
+
+        def version_key(tag: str) -> list[int]:
+            return [int(part) if part.isdigit() else 0 for part in tag[1:].split(".")]
+
+        newest = max(names, key=version_key)
+        current = self.current()
+        if version_key(newest) <= version_key(current):
+            return None, f"Обновлений нет, у меня версия {current}."
         notes = self.notes(newest)
         return newest, (f"Есть новая версия {newest}, у меня {self.current()}."
                         + (f" Что нового: {notes}" if notes else ""))

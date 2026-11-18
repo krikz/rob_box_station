@@ -16,7 +16,7 @@ TTS → динамик. Границы и план — ADR-0167 в `krikz/rob_bo
 | Автозапуск хоста при загрузке | **нет** — запущен руками `setsid nohup`, после reboot не встанет |
 | Кнопки, кольцо LED | не начато |
 | Настройка Wi-Fi по Bluetooth, страница настроек | не начато (ADR-0167 Ш6) |
-| Ядро из `krikz/rob_box_dialog_core` по тегу | **сделано** (Ш3, v0.7.2): `tools/core_ref.txt` — тег, бандлит `tools/build_core.py` |
+| Ядро из `krikz/rob_box_dialog_core` по тегу | **сделано** (Ш3, v0.7.8): `scripts/core_ref.txt` — тег, бандлит `tools/build_core.py` |
 
 ## Установка одной строкой
 
@@ -35,8 +35,10 @@ curl -sL https://raw.githubusercontent.com/krikz/rob_box_station/main/install.sh
 | Ассет | Что | Сборка (детерминированная) |
 |---|---|---|
 | `station-runtime-armv7.tar.gz` | Питон 3.12.16 armv7 + библиотеки → `/data/opt/python`, `rbx/site` | `tools/build_runtime.py` по `tools/runtime.lock` (URL + sha256) |
-| `station-core.tar.gz` | ядро диалога → `rbx/core` (`.env` переносится) | `tools/build_core.py` по тегу `tools/core_ref.txt` из `krikz/rob_box_dialog_core` |
+| `station-core.tar.gz` | ядро диалога → `rbx/core` (`.env` переносится) | `tools/build_core.py` по тегу `scripts/core_ref.txt` из `krikz/rob_box_dialog_core` |
 | `station-kws-armv7.tar.gz` | своя модель вейка → `rbx/kws` (необязательна) | `kws_run.c` → `build_kws.sh`, веса `training/kws/models/` |
+
+После голосового обновления хост на первом старте сравнивает `core/SOURCE` с пином из тега. Если ядро отличается, хост берёт `station-core.tar.gz` этого релиза, сверяет SHA-256 и сохраняет `.env`. При откате предыдущее ядро доступно в `core.prev/`.
 
 Собирает их CI (`.github/workflows/assets.yml`) на каждый тег `v*` и прикладывает к релизу с `SHA256SUMS`; руками —
 Actions → assets → Run workflow. Сверено 09.11 с колонкой 10.1.1.13: рунтайм — 2435 из 2435 бинарников и файлов
