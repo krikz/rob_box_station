@@ -902,6 +902,17 @@ def widen_window(stand) -> None:
         log_._max_tokens = max(int(log_._max_tokens), WINDOW_TOKENS)  # noqa: SLF001
 
 
+
+def llm_chain() -> list:
+    """Цепочка мозгов колонки: DeepSeek основной, MiniMax — фолбек.
+
+    Шифу 20.11: «дипсик и минимакс чтоб чтото из них работало». Один провайдер ядро цепочкой не считает —
+    фолбек строится только из двух и больше (``assembly.build_llm_chain``). Окружение и ``settings.json``
+    важнее дефолта: заданное там приходит сюда как есть.
+    """
+    return [item.strip() for item in os.environ.get("ROBBOX_LLM_PROVIDERS", "deepseek,minimax").split(",") if item.strip()]
+
+
 def make_stand(args: argparse.Namespace):
     import chat  # noqa: PLC0415
     import dry_stand  # noqa: PLC0415  (LiveClock — как у консоли)
@@ -924,7 +935,7 @@ def make_stand(args: argparse.Namespace):
         register_tool(PHONE_TOOL, PHONE_TOOL_DESCRIPTION, PHONE_TOOL_PARAMETERS)
     # Как chat.build_stand, но с нашей правкой системного промпта (дополнение + факты устройства): у консоли шов
     # system_patch, PROMPT_DIR в ядре v0.7.2 выпилен.
-    providers = [p for p in os.environ.get("ROBBOX_LLM_PROVIDERS", "deepseek").split(",") if p.strip()]
+    providers = llm_chain()
     memory = Path(args.db).expanduser().resolve() if args.db else None
     try:
         stand = chat.dm.build_real_stand(providers, Path(args.workdir), None, variant="A", memory_path=memory,
