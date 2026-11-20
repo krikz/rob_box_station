@@ -446,3 +446,16 @@ def test_window_widened_for_search_turns():
     sh.widen_window(types.SimpleNamespace(engine=types.SimpleNamespace(log=log_)))
     assert log_._max_tokens == sh.WINDOW_TOKENS >= 8000
     sh.widen_window(types.SimpleNamespace())  # без журнала — молча
+
+
+def test_llm_chain_defaults_to_deepseek_then_minimax(monkeypatch):
+    """Цепочка мозгов колонки: DeepSeek основной, MiniMax фолбек (Шифу 20.11).
+
+    Один провайдер ядро цепочкой не считает. Переменная окружения и settings.json важнее дефолта.
+    """
+    monkeypatch.delenv("ROBBOX_LLM_PROVIDERS", raising=False)
+    assert sh.llm_chain() == ["deepseek", "minimax"]
+    monkeypatch.setenv("ROBBOX_LLM_PROVIDERS", "minimax")
+    assert sh.llm_chain() == ["minimax"]
+    monkeypatch.setenv("ROBBOX_LLM_PROVIDERS", " deepseek, minimax , ")
+    assert sh.llm_chain() == ["deepseek", "minimax"]
