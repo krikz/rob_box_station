@@ -325,3 +325,34 @@ def test_bug_page_shows_api_error(tmp_path, monkeypatch):
 
     assert status == "200 OK"
     assert "не смог завести баг" in page and "403" in page
+
+
+def test_bug_lines_mask_user_dump_in_single_quotes(tmp_path):
+    """#30: дамп запроса LLM ``[N] user: '…'`` — речь человека в одинарных кавычках; вырезается и в полном логе."""
+    log = tmp_path / "station.log"
+    log.write_text(
+        "18:49:03 🔎 LLM REQUEST START\n"
+        "  [1] user: '<system_context>\\n\\nсекретная реплика человека'\n"
+        "  [2] assistant: 'фраза колонки остаётся'\n"
+        "18:49:07 ход 4.01 с: ['ответ колонки']\n",
+        encoding="utf-8")
+
+    lines = ss.bug_lines(log, everything=True)
+
+    text = "\n".join(lines)
+    assert "секретная реплика человека" not in text
+    assert "[1] user: '<…>'" in text
+    assert "[2] assistant: 'фраза колонки остаётся'" in text
+    assert "ход 4.01 с: ['ответ колонки']" in text
+
+
+def test_file_bug_masks_user_dump(monkeypatch):
+    """Тот же путь на отправке: правка текста руками не протащит дамп ``[N] user:`` в issue."""
+    sent = {}
+    monkeypatch.setattr("station_report._post",
+                        lambda url, token, payload, timeout=20: sent.update(payload) or (201, {"number": 1}))
+
+    ss.file_bug("token", "Колонка: тест", "  [3] user: '[говорит: голос без имени, запомнен] секретная реплика'")
+
+    assert "секретная реплика" not in sent["body"]
+    assert "[3] user: '<…>'" in sent["body"]
