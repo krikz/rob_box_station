@@ -182,6 +182,21 @@ def test_log_page_masks_secrets_and_shows_newest_first(tmp_path):
     assert "кольцо кадр" in ss_mod.render_log(log, everything=True)
 
 
+def test_log_page_keeps_provider_failure_line_by_default(tmp_path):
+    """#29: вид «только значимое» не прячет строку, по которой видно, почему ход закрылся фразой."""
+    import station_setup as ss_mod
+
+    log = tmp_path / "station.log"
+    log.write_text("19:09:01 🧭 [turn-v2] провайдер не ответил: -: ProviderError: 402 turn=abc\n"
+                   "19:09:01 ⏱ [provider_latency] provider=- kind=llm latency_ms=1470 status=error\n"
+                   "19:09:01    ядро: violation fields_dropped\n"
+                   "19:09:01 🔎 LLM RESPONSE: content='' finish=None\n"
+                   "19:09:01 кольцо кадр\n", encoding="utf-8")
+    page = ss_mod.render_log(log)
+
+    assert "🧭 [turn-v2] провайдер не ответил" in page
+    assert "⏱ [provider_latency]" in page and "ядро:" in page and "🔎 LLM RESPONSE" in page
+    assert "кольцо кадр" not in page
 # ---------------------------------------------------------------- «Завести баг» (#30)
 
 
