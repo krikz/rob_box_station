@@ -1126,6 +1126,7 @@ def announce_start(live: "LiveOut", version: str) -> None:
 
 async def serve(voice: Voice, args: argparse.Namespace) -> None:
     import station_bt  # noqa: PLC0415  (Bluetooth-музыка: сопряжение и пульт плеера телефона)
+    import station_setup as setup  # noqa: PLC0415  (порог удержания кнопки для бага)
     import station_update  # noqa: PLC0415  (обновление колонки с GitHub по тегу)
 
     chat, stand = make_stand(args)
@@ -1156,7 +1157,7 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
     hfp = await start_hfp(live, mic, ring)
     buttons.hfp = hfp
     install_phone_tool(stand, hfp, live)
-    Keys(asyncio.get_running_loop(), buttons.on_key)
+    Keys(asyncio.get_running_loop(), buttons.on_key, buttons.on_hold, setup.BUG_HOLD_S)
     await start_setup(stand, mic, ring, buttons)
     asyncio.ensure_future(deaf_watchdog(mic, live, lambda: bool(hfp and hfp.in_call)))
     announce_start(live, version)
@@ -1584,11 +1585,17 @@ class Ring:
 
 
 class Keys:
-    """Кнопки колонки: поток читает ``/dev/input/event0,1`` и отдаёт код нажатия в цикл asyncio."""
+    """Кнопки колонки: поток читает ``/dev/input/event0,1`` и отдаёт код нажатия в цикл asyncio.
 
-    def __init__(self, loop: asyncio.AbstractEventLoop, handler) -> None:
-        self._loop, self._handler = loop, handler
+    ``on_hold`` — удержание дольше порога (value 2 автоповтор ядро шлёт, пока палец не отпущен; value 0 —
+    отпустили). Короткое нажатие идёт в ``handler``, как раньше.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, handler, on_hold=None, hold_s: float = 0.0) -> None:
+        self._loop, self._handler, self._on_hold = loop, handler, on_hold
+        self._hold_s = hold_s
         self._last = 0.0
+        self._down: dict = {}
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self) -> None:
@@ -1604,13 +1611,31 @@ class Keys:
                     _sec, _usec, typ, code, value = struct.unpack_from("IIHHi", data, off)  # input_event armhf
                     if typ == 1 and value == 1:
                         self._press(code)
+                    elif typ == 1 and value == 0:
+                        self._release(code)
+                    elif typ == 1 and value == 2:
+                        self._repeat(code)
 
     def _press(self, code: int) -> None:
         now = time.monotonic()
-        if now - self._last < KEY_GUARD_S:
+        if now - self._last < KEY_GUARD_S and code not in self._down:
             return  # пара сенсорных кнопок в одну метку — второе нажатие не считаем
         self._last = now
+        self._down[code] = now
         self._loop.call_soon_threadsafe(self._handler, code)
+
+    def _release(self, code: int) -> None:
+        self._down.pop(code, None)
+
+    def _repeat(self, code: int) -> None:
+        """Автоповтор ядра: палец всё ещё на кнопке. Порог перейдён — один раз, не на каждом повторе."""
+        started = self._down.get(code)
+        if started is None or self._on_hold is None or self._hold_s <= 0:
+            return
+        if time.monotonic() - started < self._hold_s:
+            return
+        self._down.pop(code, None)  # второй раз за то же удержание не зовём
+        self._loop.call_soon_threadsafe(self._on_hold, code)
 
 
 def click() -> None:
@@ -1627,6 +1652,7 @@ class Buttons:
         self.volume = int(VOLUME)
         self.armed_until = 0.0
         self.hfp = None  # звонок: кнопка Алисы принимает/сбрасывает (station_hfp)
+        self.bug = None  # удержание кнопки: завести баг (ставится в start_setup)
 
     def on_key(self, code: int) -> None:
         if self.auth is not None:
@@ -1656,6 +1682,11 @@ class Buttons:
         if not self._live.busy():
             self._click()
         log(f"🔘 громкость {self.volume}")
+
+    def on_hold(self, code: int) -> None:
+        """Удержание любой кнопки дольше порога: завести баг. Короткое нажатие сюда не приходит."""
+        if self.bug is not None:
+            self.bug(code)
 
     def _action(self) -> None:
         hfp = self.hfp
@@ -1712,12 +1743,32 @@ class Buttons:
         return f"Игорёк, {text}"
 
 
+async def file_bug_from_button(code: int) -> None:
+    """Удержание кнопки колонки: тот же сценарий, что «Завести баг» на странице, с хвостом лога на этот момент.
+
+    Сеть — в потоке, чтобы не держать цикл. Ошибку не глотаем: строка ``📮`` в логе скажет, вышло или нет.
+    """
+    import station_setup as setup  # noqa: PLC0415
+
+    token = os.environ.get("GH_ISSUE_TOKEN", "").strip()
+    if not token:
+        try:
+            token = setup.read_env(CORE / "scripts" / "dialogue" / ".env").get("GH_ISSUE_TOKEN", "").strip()
+        except OSError:
+            token = ""
+    log(f"🔘 удержание {setup.BUG_HOLD_S:.0f} с (кнопка {code}) — завожу баг, прикладываю хвост лога")
+    note, url = await asyncio.to_thread(setup.file_bug_from_hold, setup.LOG_PATH, BASE, token)
+    log(f"📮 {note}" + (f" {url}" if url else ""))
+
+
 async def start_setup(stand, mic: Mic, ring: Ring, buttons: "Buttons") -> None:
     """Improv Wi-Fi по Bluetooth и страница настроек (``station_setup``); сбой одного не роняет хост."""
     import station_setup as setup  # noqa: PLC0415
 
     auth = setup.Auth()
     buttons.auth = auth
+    buttons.bug = lambda code: asyncio.get_running_loop().call_soon(
+        lambda: asyncio.ensure_future(file_bug_from_button(code)))
     for name, value in (("RBX_WAKE", ",".join(WAKE_WORDS)), ("RBX_VOLUME", VOLUME), ("RBX_LED", str(LED_BRIGHT)),
                         ("RBX_RING_STYLE", "color")):
         os.environ.setdefault(name, value)  # форма страницы показывает то, что сейчас в силе

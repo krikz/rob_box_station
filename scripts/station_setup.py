@@ -435,13 +435,19 @@ def log_tail(path: Path, everything: bool = False, limit: int = 400) -> List[str
 BUG_MARKERS = LOG_MARKERS + ("🧭", "⏱", "🔎", "ядро:")
 #: Сколько строк лога и символов тела issue (issue не должен быть свалкой).
 BUG_MAX_LINES, BUG_MAX_CHARS = 200, 12000
+#: Удержание кнопки колонки, после которого заводится баг. Короткое нажатие — как было.
+#: ``RBX_BUG_HOLD_S`` — только настройка порога (секунды); дефолт 20. Меньше секунды не берём:
+#: иначе случайное касание публикует issue.
+BUG_HOLD_S = max(1.0, float(os.environ.get("RBX_BUG_HOLD_S", "20")))
 #: Реплика человека: текст в кавычках «» (STT) или цитата голоса. В публичный issue не уходит.
 _SPEECH_RE = re.compile(r"[«\"][^»\"\n]{2,}[»\"]")
 _CHAT_ID_RE = re.compile(r"(?i)\b(chat_id|user_id|speaker_id)\b\s*[=:]\s*\S+")
-#: Дамп окна запроса LLM: ``  [1] user: '<system_context>…реплика'``. Содержимое — речь человека,
-#: в одинарных кавычках, которые общий регекс не ловит. Режем строку целиком, не любые одинарные кавычки:
-#: ``ход 4.01 с: ['…']`` — фраза колонки, её портить нельзя. ``[N] assistant:`` не трогаем — там колонка.
-_USER_DUMP_RE = re.compile(r"^(\s*\[\d+\] user: )'.*'$")
+#: Дамп окна запроса LLM: ``[N] user: '<system_context>…реплика'``. Содержимое — речь человека,
+#: в одинарных кавычках, которые общий регекс не ловит. Префикс до ``[N]`` допустим: строка лога несёт время
+#: и маркер (``18:49:30 🔎 [1] user: '…'``), и без него дамп уходил в issue как служебная строка.
+#: Режем до конца строки, не любые одинарные кавычки: ``ход 4.01 с: ['…']`` — фраза колонки, её портить нельзя.
+#: ``[N] assistant:`` не трогаем — там колонка.
+_USER_DUMP_RE = re.compile(r"^(.*\[\d+\] user: )'.*'$")
 _SPEECH_MASK = "«…»"
 
 
@@ -495,10 +501,19 @@ def bug_lines(path: Path, everything: bool, limit: int = BUG_MAX_LINES) -> List[
     return masked
 
 
+def bug_hold_reached(held_s: float, threshold_s: float = BUG_HOLD_S) -> bool:
+    """Удержание заводит баг ровно с порога: 19 с при пороге 20 — нет, 20 с — да. Короче порога — нет."""
+    return held_s >= threshold_s
+
+
 def bug_draft(path: Path, base: Path, everything: bool = False, reason: str = "",
-              repo: Optional[Path] = None) -> Tuple[str, str]:
-    """(заголовок, тело) черновика issue: ровно то, что уйдёт после подтверждения."""
-    head = " ".join(reason.split()) or "со страницы лога"
+              repo: Optional[Path] = None, source: str = "page") -> Tuple[str, str]:
+    """(заголовок, тело) черновика issue: ровно то, что уйдёт после подтверждения.
+
+    ``source="hold"`` — то же тело, но заведено удержанием кнопки колонки, а не кликом на странице.
+    Фильтр строк и маскировка те же: реплики и дамп ``[N] user:`` в issue не попадают.
+    """
+    head = " ".join(reason.split()) or ("удержание кнопки" if source == "hold" else "со страницы лога")
     if len(head) > 60:
         head = head[:60].rsplit(" ", 1)[0].rstrip(" ,.;:—-") or head[:60]
     title = f"Колонка: {head}"
@@ -507,14 +522,30 @@ def bug_draft(path: Path, base: Path, everything: bool = False, reason: str = ""
     if len(excerpt) > BUG_MAX_CHARS:
         excerpt = "…\n" + excerpt[-BUG_MAX_CHARS:]
     kind = "все строки (после маскировки)" if everything else "только служебные строки"
+    if source == "hold":
+        how = (f"Заведено удержанием кнопки колонки {BUG_HOLD_S:.0f} с "
+               "(тот же сценарий, что кнопка «Завести баг» на странице лога).")
+    else:
+        how = "Заведено кнопкой «Завести баг» со страницы лога колонки."
     body = "\n".join([
-        "Заведено кнопкой «Завести баг» со страницы лога колонки.", "",
+        how, "",
         f"- версия ядра: `{read_version(base)}`",
         f"- версия станции: `{station_version(repo)}`",
         f"- лог: {kind}, хвост, время — по часам хоста", "",
         "```", excerpt or "лог пуст", "```", "",
     ])
     return title, body
+
+
+def file_bug_from_hold(path: Path, base: Path, token: str, post: Optional[Callable] = None,
+                       repo: Optional[Path] = None) -> Tuple[str, str]:
+    """Удержание кнопки: тот же ``file_bug``, тело — хвост лога на этот момент, после той же маскировки.
+
+    Предпросмотра нет: кнопку держат на колонке, страницу никто не смотрит. Что уйдёт в issue, решает код
+    (служебные строки, реплики и дамп ``[N] user:`` вырезаны), а не человек на странице.
+    """
+    title, body = bug_draft(path, base, everything=False, source="hold", repo=repo)
+    return file_bug(token, title, body, post)
 
 
 def file_bug(token: str, title: str, body: str, post: Optional[Callable] = None) -> Tuple[str, str]:
@@ -538,16 +569,49 @@ def file_bug(token: str, title: str, body: str, post: Optional[Callable] = None)
 
 
 def render_log(path: Path, everything: bool = False) -> str:
-    """Страница ``/log`` (#17): свежее — сверху, обновление каждые 10 с."""
+    """Страница ``/log`` (#17): свежее — сверху, обновление каждые 10 с.
+
+    Ссылка «Завести баг» коротким нажатием открывает предпросмотр, как раньше. Удержание не короче
+    ``BUG_HOLD_S`` само заводит карточку (``POST /bug/hold``) и показывает полоску — без отдельной страницы.
+    """
     lines = log_tail(path, everything)
     body = html.escape("\n".join(reversed(lines))) or "лог пуст"
     other = ('<a href="/log">только значимое</a>' if everything else '<a href="/log?all=1">все строки</a>')
+    hold = f"{BUG_HOLD_S:.0f}"
     return f"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="10">
 <title>Лог колонки</title><style>{STYLE}pre{{white-space:pre-wrap;word-break:break-word;font:12px ui-monospace,
-monospace}}body{{max-width:900px}}</style></head><body><h1>Лог колонки</h1><p><a href="/">← настройки</a> · {other}
-· <a href="/bug">Завести баг</a>
-· <small>свежее сверху, страница обновляется каждые 10 с; ключи скрыты</small></p><pre>{body}</pre></body></html>"""
+monospace}}body{{max-width:900px}}
+#holdbar{{display:none;height:6px;background:#ddd;border-radius:3px;margin:6px 0;max-width:220px}}
+#holdbar>i{{display:block;height:100%;width:0;background:#c45c26;border-radius:3px}}
+@media(prefers-color-scheme:dark){{#holdbar{{background:#333}}}}</style></head><body><h1>Лог колонки</h1>
+<p><a href="/">← настройки</a> · {other}
+· <a href="/bug" id="bugbtn">Завести баг</a>
+· <small>свежее сверху, страница обновляется каждые 10 с; ключи скрыты.
+Удержание ссылки {hold} с заводит баг само, с хвостом лога.</small></p>
+<div id="holdbar"><i id="holdfill"></i></div><p id="holdnote" hidden></p><pre>{body}</pre>
+<script>
+(function(){{
+  var btn=document.getElementById("bugbtn"), bar=document.getElementById("holdbar"),
+      fill=document.getElementById("holdfill"), note=document.getElementById("holdnote");
+  var hold={hold}*1000, t0=0, timer=null, fired=false;
+  function tick(){{
+    var k=Math.min(1,(Date.now()-t0)/hold);
+    fill.style.width=(k*100)+"%";
+    if(k>=1 && !fired){{ fired=true; clearInterval(timer); note.hidden=false;
+      note.textContent="держу "+({hold})+" с — завожу баг, прикладываю хвост лога…";
+      fetch("/bug/hold",{{method:"POST"}}).then(function(r){{return r.text();}}).then(function(t){{
+        note.textContent=t;}}).catch(function(){{ note.textContent="не смог завести баг: страница не ответила"; }});
+    }}
+  }}
+  function down(e){{ if(e.button && e.button!==0) return; fired=false; t0=Date.now();
+    bar.style.display="block"; fill.style.width="0"; clearInterval(timer); timer=setInterval(tick,100); }}
+  function up(){{ clearInterval(timer); if(!fired){{ bar.style.display="none"; }} }}
+  btn.addEventListener("mousedown", down);
+  btn.addEventListener("touchstart", function(e){{ e.preventDefault(); down(e); }}, {{passive:false}});
+  ["mouseup","mouseleave","touchend","touchcancel"].forEach(function(n){{ btn.addEventListener(n, up); }});
+}})();
+</script></body></html>"""
 
 
 def render_bug(title: str, body: str, everything: bool, note: str = "", url: str = "") -> str:
@@ -644,6 +708,8 @@ class SettingsServer:
             return "200 OK", render_log(self.log_path, query.get("all") == ["1"])
         if target.split("?")[0] == "/bug":
             return self._bug(method, target, body)
+        if target.split("?")[0] == "/bug/hold":
+            return self._bug_hold(method)
         if method != "POST" or target not in ("/save", "/prompt", "/wifi"):
             return "404 Not Found", "not found"
         form = {k: v[0] for k, v in urllib.parse.parse_qs(body.decode("utf-8"), keep_blank_values=True).items()}
@@ -672,6 +738,16 @@ class SettingsServer:
         note, url = file_bug(self.token(), title, body)
         self.log(f"📮 {note}" + (f" {url}" if url else ""))
         return "200 OK", render_bug(title, body, everything, note, url)
+
+    def _bug_hold(self, method: str) -> Tuple[str, str]:
+        """Удержание ссылки «Завести баг»: тот же ``file_bug``, хвост лога на этот момент. Короткого пути нет —
+        страница шлёт POST только когда полоска дошла до порога."""
+        if method != "POST":
+            return "404 Not Found", "not found"
+        note, url = file_bug_from_hold(self.log_path, self.base, self.token())
+        self.log(f"📮 удержание: {note}" + (f" {url}" if url else ""))
+        text = note + (f" {url}" if url else "")
+        return ("200 OK" if note.startswith("Завёл") else "502 Bad Gateway"), text
 
     def _save(self, form: Dict[str, str]) -> str:
         new = check_settings(form)

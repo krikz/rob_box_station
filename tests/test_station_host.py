@@ -459,3 +459,78 @@ def test_llm_chain_defaults_to_deepseek_then_minimax(monkeypatch):
     assert sh.llm_chain() == ["minimax"]
     monkeypatch.setenv("ROBBOX_LLM_PROVIDERS", " deepseek, minimax , ")
     assert sh.llm_chain() == ["deepseek", "minimax"]
+
+
+class _Clock:
+    """Монотонные часы для порога удержания: тест двигает время сам, не ждёт 20 с."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def _keys(clock, handler, on_hold, hold_s):
+    keys = object.__new__(sh.Keys)
+    keys._handler, keys._on_hold, keys._hold_s = handler, on_hold, hold_s
+    keys._last, keys._down = 0.0, {}
+    keys._loop = types.SimpleNamespace(call_soon_threadsafe=lambda fn, *a: fn(*a))
+    return keys
+
+
+def test_key_hold_fires_at_threshold_not_before(monkeypatch):
+    """19 с удержания баг не заводят, 20 с — заводят один раз, не на каждом автоповторе."""
+    clock = _Clock()
+    monkeypatch.setattr(sh.time, "monotonic", clock.monotonic)
+    presses, holds = [], []
+    keys = _keys(clock, presses.append, holds.append, 20.0)
+
+    keys._press(sh.KEY_ACTION)
+    clock.now += 19.0
+    keys._repeat(sh.KEY_ACTION)  # ядро шлёт автоповтор, палец ещё на кнопке
+    assert holds == [] and presses == [sh.KEY_ACTION]
+
+    clock.now += 1.0  # ровно 20 с от нажатия
+    keys._repeat(sh.KEY_ACTION)
+    keys._repeat(sh.KEY_ACTION)  # тот же палец — второй раз не зовём
+    assert holds == [sh.KEY_ACTION]
+
+
+def test_key_release_before_threshold_files_nothing(monkeypatch):
+    """Отпустили раньше порога — удержание не считается, следующее короткое нажатие идёт как обычно."""
+    clock = _Clock()
+    monkeypatch.setattr(sh.time, "monotonic", clock.monotonic)
+    holds = []
+    keys = _keys(clock, lambda code: None, holds.append, 20.0)
+
+    keys._press(sh.KEY_MUTE)
+    clock.now += 19.0
+    keys._release(sh.KEY_MUTE)
+    keys._repeat(sh.KEY_MUTE)  # повтора после отпускания быть не должно, но и он не должен завести баг
+    assert holds == []
+
+
+def test_button_hold_files_bug_with_log_tail(tmp_path, monkeypatch):
+    """Удержание доходит до file_bug_from_hold: в issue уходит хвост лога, реплика человека вырезана."""
+    import station_setup as sh_setup  # noqa: E402
+
+    log = tmp_path / "station.log"
+    log.write_text("18:49:12 \U0001f50a синтез: «секретная реплика»\n18:49:13 \U0001f9ed [turn-v2] отказ\n",
+                   encoding="utf-8")
+    (tmp_path / "VERSION").write_text("v0.7.10\n", encoding="utf-8")
+    monkeypatch.setattr(sh, "BASE", tmp_path)
+    sent = {}
+    monkeypatch.setattr(sh_setup, "LOG_PATH", log)
+    monkeypatch.setattr(sh_setup, "station_version", lambda repo=None: "station-test")
+    import station_report
+    monkeypatch.setattr(station_report, "_post",
+                        lambda url, token, payload, timeout=20: sent.update(payload=payload) or (201, {"number": 7}))
+    monkeypatch.setenv("GH_ISSUE_TOKEN", "tok")
+
+    asyncio.run(sh.file_bug_from_button(sh.KEY_ACTION))
+
+    body = sent["payload"]["body"]
+    assert "удержанием кнопки" in body and "v0.7.10" in body
+    assert "turn-v2" in body  # хвост лога на момент удержания
+    assert "секретная реплика" not in body
