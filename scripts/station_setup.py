@@ -17,6 +17,7 @@ import asyncio  # без ``from __future__ import annotations``: dbus-next чи�
 import html
 import json
 import os
+import re
 import time
 import urllib.parse
 from pathlib import Path
@@ -426,8 +427,118 @@ def log_tail(path: Path, everything: bool = False, limit: int = 400) -> List[str
     return [station_report.mask_secrets(line) for line in lines[-limit:]]
 
 
+# ---------------------------------------------------------------- «Завести баг» (#30)
+
+
+#: Служебные строки черновика issue: маркеры страницы плюс те, по которым видна причина
+#: (``🧭 ⏱ 🔎 ядро:``). Страница их по умолчанию прячет, а в баге они нужны (карточка #30).
+BUG_MARKERS = LOG_MARKERS + ("🧭", "⏱", "🔎", "ядро:")
+#: Сколько строк лога и символов тела issue (issue не должен быть свалкой).
+BUG_MAX_LINES, BUG_MAX_CHARS = 200, 12000
+#: Реплика человека: текст в кавычках «» (STT) или цитата голоса. В публичный issue не уходит.
+_SPEECH_RE = re.compile(r"[«\"][^»\"\n]{2,}[»\"]")
+_CHAT_ID_RE = re.compile(r"(?i)\b(chat_id|user_id|speaker_id)\b\s*[=:]\s*\S+")
+#: Дамп окна запроса LLM: ``  [1] user: '<system_context>…реплика'``. Содержимое — речь человека,
+#: в одинарных кавычках, которые общий регекс не ловит. Режем строку целиком, не любые одинарные кавычки:
+#: ``ход 4.01 с: ['…']`` — фраза колонки, её портить нельзя. ``[N] assistant:`` не трогаем — там колонка.
+_USER_DUMP_RE = re.compile(r"^(\s*\[\d+\] user: )'.*'$")
+_SPEECH_MASK = "«…»"
+
+
+def mask_speech(text: str) -> str:
+    """Убрать реплики и идентификаторы человека: кавычки «» → «…», chat_id/user_id — спрятать значение.
+
+    Строка дампа ``[N] user: '…'`` заменяется целиком на ``[N] user: '<…>'``: внутри речь человека,
+    включая пометку ``[говорит: …]``. Одинарные кавычки в остальных строках не трогаем.
+    """
+    text = _CHAT_ID_RE.sub(lambda m: f"{m.group(1)}=***", text)
+    dumped = _USER_DUMP_RE.sub(lambda m: f"{m.group(1)}'<…>'", text)
+    if dumped != text:
+        return dumped
+    return _SPEECH_RE.sub(_SPEECH_MASK, text)
+
+
+def read_version(base: Path) -> str:
+    """Версия ядра из ``VERSION`` в ``/data/opt/rbx``; нет файла — честно «без версии»."""
+    try:
+        return (base / "VERSION").read_text(encoding="utf-8-sig").strip() or "без версии"
+    except OSError:
+        return "без версии"
+
+
+def station_version(repo: Optional[Path] = None) -> str:
+    """Версия станции: ``git describe``; git нет или это не репозиторий — «неизвестно»."""
+    import subprocess  # noqa: PLC0415
+
+    try:
+        out = subprocess.run(["git", "-C", str(repo or Path(__file__).resolve().parent.parent),
+                              "describe", "--tags", "--always", "--dirty"],
+                             capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return "неизвестно"
+    return out.stdout.strip() or "неизвестно"
+
+
+def bug_lines(path: Path, everything: bool, limit: int = BUG_MAX_LINES) -> List[str]:
+    """Строки черновика: оба файла лога, секреты и реплики скрыты; без ``everything`` — служебные."""
+    import station_report  # noqa: PLC0415
+
+    lines: List[str] = []
+    for p in (path.with_name(path.name + ".1"), path):
+        try:
+            lines += p.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+    if not everything:
+        lines = [line for line in lines if any(k in line for k in BUG_MARKERS)]
+    masked = [mask_speech(station_report.mask_secrets(line.rstrip())) for line in lines[-limit:]]
+    return masked
+
+
+def bug_draft(path: Path, base: Path, everything: bool = False, reason: str = "",
+              repo: Optional[Path] = None) -> Tuple[str, str]:
+    """(заголовок, тело) черновика issue: ровно то, что уйдёт после подтверждения."""
+    head = " ".join(reason.split()) or "со страницы лога"
+    if len(head) > 60:
+        head = head[:60].rsplit(" ", 1)[0].rstrip(" ,.;:—-") or head[:60]
+    title = f"Колонка: {head}"
+    lines = bug_lines(path, everything)
+    excerpt = "\n".join(lines)
+    if len(excerpt) > BUG_MAX_CHARS:
+        excerpt = "…\n" + excerpt[-BUG_MAX_CHARS:]
+    kind = "все строки (после маскировки)" if everything else "только служебные строки"
+    body = "\n".join([
+        "Заведено кнопкой «Завести баг» со страницы лога колонки.", "",
+        f"- версия ядра: `{read_version(base)}`",
+        f"- версия станции: `{station_version(repo)}`",
+        f"- лог: {kind}, хвост, время — по часам хоста", "",
+        "```", excerpt or "лог пуст", "```", "",
+    ])
+    return title, body
+
+
+def file_bug(token: str, title: str, body: str, post: Optional[Callable] = None) -> Tuple[str, str]:
+    """Создать issue → (сообщение человеку, ссылка или ""). Ошибку не глотает: говорит, что не вышло и почему."""
+    import station_report  # noqa: PLC0415
+
+    token = (token or "").strip()
+    if not token:
+        return "не смог завести баг: нет токена (GH_ISSUE_TOKEN в окружении или в .env)", ""
+    title, body = station_report.mask_secrets(mask_speech(title)), station_report.mask_secrets(mask_speech(body))
+    send = post or station_report._post
+    try:
+        status, answer = send(f"https://api.github.com/repos/{station_report.REPO}/issues", token,
+                              {"title": title, "body": body})
+    except Exception as exc:  # noqa: BLE001 — сеть не роняет страницу, ошибку показываем
+        return f"не смог завести баг: гитхаб не ответил ({type(exc).__name__}: {exc})", ""
+    if status not in (200, 201) or not answer.get("number"):
+        return f"не смог завести баг: гитхаб ответил {status}", ""
+    url = str(answer.get("html_url") or "")
+    return f"Завёл баг: issue номер {answer['number']}", url
+
+
 def render_log(path: Path, everything: bool = False) -> str:
-    """Страница ``/log`` (#17: «нет возможности увидеть логи на странице настроек»): свежее — сверху, обновление 10 с."""
+    """Страница ``/log`` (#17): свежее — сверху, обновление каждые 10 с."""
     lines = log_tail(path, everything)
     body = html.escape("\n".join(reversed(lines))) or "лог пуст"
     other = ('<a href="/log">только значимое</a>' if everything else '<a href="/log?all=1">все строки</a>')
@@ -435,7 +546,27 @@ def render_log(path: Path, everything: bool = False) -> str:
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="10">
 <title>Лог колонки</title><style>{STYLE}pre{{white-space:pre-wrap;word-break:break-word;font:12px ui-monospace,
 monospace}}body{{max-width:900px}}</style></head><body><h1>Лог колонки</h1><p><a href="/">← настройки</a> · {other}
+· <a href="/bug">Завести баг</a>
 · <small>свежее сверху, страница обновляется каждые 10 с; ключи скрыты</small></p><pre>{body}</pre></body></html>"""
+
+
+def render_bug(title: str, body: str, everything: bool, note: str = "", url: str = "") -> str:
+    """Предпросмотр бага (#30): ровно тот текст, который уйдёт в issue. Сама страница ничего не публикует —
+    публикация только кнопкой «Завести» (POST). ``note`` — честный итог: номер и ссылка либо почему не вышло."""
+    link = f'<p><a href="{html.escape(url)}">{html.escape(url)}</a></p>' if url else ""
+    banner = f'<p class="note"><b>{html.escape(note)}</b></p>{link}' if note else ""
+    checked = " checked" if everything else ""
+    return f"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Завести баг</title>
+<style>{STYLE}textarea{{font:12px ui-monospace,monospace}}body{{max-width:900px}}</style></head><body>
+<h1>Завести баг</h1><p><a href="/log">← лог</a> · <small>ниже ровно то, что уйдёт в issue; само ничего не публикуется.
+Реплики и ключи вырезаны.</small></p>{banner}
+<form method="get" action="/bug"><label class="check"><input type="checkbox" name="all" value="1"{checked}
+onchange="this.form.submit()">полный лог (после маскировки)</label></form>
+<form method="post" action="/bug"><label>Заголовок<input name="title" value="{html.escape(title)}"></label>
+<label>Текст issue<textarea name="body" rows="18">{html.escape(body)}</textarea></label>
+<input type="hidden" name="all" value="{"1" if everything else "0"}">
+<button type="submit">Завести</button> <small>создаст issue в krikz/rob_box_station</small></form></body></html>"""
 
 
 # ---------------------------------------------------------------- HTTP
@@ -450,11 +581,22 @@ class SettingsServer:
     def __init__(self, settings_path: Path, env_path: Path, auth: Auth,
                  on_saved: Callable[[Dict[str, str], List[str]], None], log, prompts: Optional[Prompts] = None,
                  on_prompt: Optional[Callable[[], None]] = None,
-                 on_wifi: Optional[Callable[[bool], None]] = None) -> None:
+                 on_wifi: Optional[Callable[[bool], None]] = None,
+                 base: Optional[Path] = None, log_path: Optional[Path] = None,
+                 token: Optional[Callable[[], str]] = None) -> None:
         self.settings_path, self.env_path, self.auth = settings_path, env_path, auth
         self.on_saved, self.log = on_saved, log
         self.prompts, self.on_prompt, self.on_wifi = prompts, on_prompt, on_wifi
         self.wifi_last = ""
+        #: Куда смотреть за версией ядра и логом для кнопки «Завести баг» (#30); по умолчанию — живая колонка.
+        self.base = base or Path(os.environ.get("RBX_BASE", "/data/opt/rbx"))
+        self.log_path = log_path or LOG_PATH
+        self.token = token or self._issue_token
+
+    def _issue_token(self) -> str:
+        """Токен для issue: окружение, иначе ``.env`` (права 600). На страницу и в репозиторий не попадает."""
+        token = os.environ.get("GH_ISSUE_TOKEN", "").strip()
+        return token or read_env(self.env_path).get("GH_ISSUE_TOKEN", "").strip()
 
     async def start(self) -> None:
         await asyncio.start_server(self._client, "0.0.0.0", HTTP_PORT)
@@ -489,7 +631,8 @@ class SettingsServer:
                 "last": self.wifi_last}
 
     async def _page(self, note: str = "") -> str:
-        current = {k: os.environ.get(k, "") for k in ("RBX_WAKE", "RBX_VOLUME", "RBX_LED", "RBX_VOICE", "RBX_RING_STYLE")}
+        current = {k: os.environ.get(k, "") for k in
+                        ("RBX_WAKE", "RBX_VOLUME", "RBX_LED", "RBX_VOICE", "RBX_RING_STYLE")}
         settings = {**current, **load_settings(self.settings_path)}
         return render_page(settings, read_env(self.env_path), note, self.prompts, await self._wifi_info())
 
@@ -498,7 +641,9 @@ class SettingsServer:
             return "200 OK", await self._page()
         if method == "GET" and target.split("?")[0] == "/log":
             query = urllib.parse.parse_qs(target.partition("?")[2])
-            return "200 OK", render_log(LOG_PATH, query.get("all") == ["1"])
+            return "200 OK", render_log(self.log_path, query.get("all") == ["1"])
+        if target.split("?")[0] == "/bug":
+            return self._bug(method, target, body)
         if method != "POST" or target not in ("/save", "/prompt", "/wifi"):
             return "404 Not Found", "not found"
         form = {k: v[0] for k, v in urllib.parse.parse_qs(body.decode("utf-8"), keep_blank_values=True).items()}
@@ -509,6 +654,24 @@ class SettingsServer:
         except ValueError as exc:
             return "400 Bad Request", await self._page(f"Не сохранено: {exc}")
         return "200 OK", await self._page(note)
+
+    def _bug(self, method: str, target: str, raw: bytes) -> Tuple[str, str]:
+        """``GET /bug`` — предпросмотр (ничего не публикует); ``POST /bug`` — создать issue и показать итог."""
+        if method == "GET":
+            query = urllib.parse.parse_qs(target.partition("?")[2])
+            everything = query.get("all") == ["1"]
+            title, body = bug_draft(self.log_path, self.base, everything)
+            return "200 OK", render_bug(title, body, everything)
+        if method != "POST":
+            return "404 Not Found", "not found"
+        form = {k: v[0] for k, v in urllib.parse.parse_qs(raw.decode("utf-8"), keep_blank_values=True).items()}
+        title, body = form.get("title", "").strip(), form.get("body", "")
+        everything = form.get("all") == "1"
+        if not title or not body.strip():
+            return "400 Bad Request", render_bug(title, body, everything, "Не заведено: пустой заголовок или текст.")
+        note, url = file_bug(self.token(), title, body)
+        self.log(f"📮 {note}" + (f" {url}" if url else ""))
+        return "200 OK", render_bug(title, body, everything, note, url)
 
     def _save(self, form: Dict[str, str]) -> str:
         new = check_settings(form)
