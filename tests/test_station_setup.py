@@ -371,3 +371,50 @@ def test_file_bug_masks_user_dump(monkeypatch):
 
     assert "секретная реплика" not in sent["body"]
     assert "[3] user: '<…>'" in sent["body"]
+
+
+def test_bug_hold_threshold_is_twenty_seconds():
+    """Удержание заводит баг с порога, не раньше: 19 с — нет, 20 с — да. Порог — константа, дефолт 20."""
+    assert ss.BUG_HOLD_S == 20.0
+
+    assert ss.bug_hold_reached(19.0, 20.0) is False
+    assert ss.bug_hold_reached(19.999, 20.0) is False
+    assert ss.bug_hold_reached(20.0, 20.0) is True
+    assert ss.bug_hold_reached(25.0, 20.0) is True
+
+
+def test_hold_files_same_bug_with_log_tail_and_no_speech(tmp_path, monkeypatch):
+    """Удержание идёт тем же file_bug: хвост лога в теле, реплики и дамп ``[N] user:`` вырезаны."""
+    log = _bug_log(tmp_path)
+    log.write_text(
+        log.read_text(encoding="utf-8")
+        + "18:49:30 🔎 LLM REQUEST START\n"
+        + "18:49:30 🔎 [1] user: '<system_context> секретная реплика человека'\n"
+        + "  [2] assistant: 'фраза колонки остаётся'\n"
+        + "18:49:31 🧭 [turn-v2] провайдер не ответил\n",
+        encoding="utf-8")
+    (tmp_path / "VERSION").write_text("v0.7.10\n", encoding="utf-8")
+    monkeypatch.setattr(ss, "station_version", lambda repo=None: "station-test")
+    sent = {}
+    monkeypatch.setattr("station_report._post",
+                        lambda url, token, payload, timeout=20: sent.update(payload) or (201, {"number": 40}))
+
+    note, url = ss.file_bug_from_hold(log, tmp_path, "token")
+
+    assert note == "Завёл баг: issue номер 40"
+    body = sent["body"]
+    assert "удержанием кнопки" in body and "v0.7.10" in body and "station-test" in body
+    assert "🧭" in body  # хвост лога на момент удержания — в теле
+    assert "секретная реплика человека" not in body and "[1] user: '<…>'" in body
+    assert "открой дверь пожалуйста" not in body and "sk-supersecretkeyvalue1" not in body
+    assert "кольцо кадр" not in body  # полный лог в удержании не уходит, только служебные строки
+
+
+def test_log_page_hold_does_not_fire_before_threshold():
+    """Короткое нажатие остаётся ссылкой на предпросмотр; страница шлёт POST только на пороге."""
+    page = ss.render_log(Path("/no/such.log"))
+
+    assert 'href="/bug"' in page and 'id="bugbtn"' in page
+    assert 'fetch("/bug/hold"' in page
+    assert f"var hold={ss.BUG_HOLD_S:.0f}*1000" in page
+    assert "if(k>=1 && !fired)" in page  # до порога (k<1) запрос не уходит
