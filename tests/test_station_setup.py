@@ -180,3 +180,148 @@ def test_log_page_masks_secrets_and_shows_newest_first(tmp_path):
     assert page.index("ход 1 с") < page.index("первая") < page.index("старый прогон")
     assert "sk-abcdefghijklmnopqrstu" not in page and "кольцо кадр" not in page
     assert "кольцо кадр" in ss_mod.render_log(log, everything=True)
+
+
+# ---------------------------------------------------------------- «Завести баг» (#30)
+
+
+_BUG_LOG = (
+    "18:47:12 🎤 4.2 с → STT yandex 1.42 с: «открой дверь пожалуйста»  🔑 kws igorek 0.99\n"
+    "18:47:12 🔎 LLM REQUEST START provider=deepseek DEEPSEEK_API_KEY=sk-supersecretkeyvalue1\n"
+    "18:49:03 🧭 [turn-v2] провайдер не ответил: timeout\n"
+    "18:49:03 ⏱ [provider_latency] provider=deepseek status=error\n"
+    "18:49:07 ход 3.53 с: ['ответ колонки']\n"
+    "18:49:07 ядро: violation=bad_command\n"
+    "18:49:12 🔊 синтез: «Что-то я долго думаю — повтори, пожалуйста.»\n"
+    "18:49:20 chat_id=123456789 пользователь сказал «привет»\n"
+    "кольцо кадр 5\n"
+)
+
+
+def _bug_log(tmp_path):
+    log = tmp_path / "station.log"
+    (tmp_path / "station.log.1").write_text("09:00:00 🎤 старый прогон: «старая реплика»\n", encoding="utf-8")
+    log.write_text(_BUG_LOG, encoding="utf-8")
+    return log
+
+
+def test_log_page_has_bug_button():
+    """#30: на /log кнопка «Завести баг» рядом с переключателем вида."""
+    page = ss.render_log(Path("/no/such.log"))
+
+    assert 'href="/bug"' in page and "Завести баг" in page
+    assert page.index("Завести баг") > page.index("все строки")
+
+
+def test_bug_preview_shows_exactly_what_will_be_sent(tmp_path):
+    """Предпросмотр — ровно текст черновика, и сам по себе ничего не публикует (это GET-форма)."""
+    log = _bug_log(tmp_path)
+    title, body = ss.bug_draft(log, tmp_path)
+    page = ss.render_bug(title, body, everything=False)
+
+    assert "Завести баг" in page and 'method="post" action="/bug"' in page
+    assert title in page and "версия ядра" in page
+    assert "sk-supersecretkeyvalue1" not in page and "открой дверь пожалуйста" not in page
+    assert "полный лог" in page
+
+
+def test_bug_draft_strips_secrets_and_speech(tmp_path, monkeypatch):
+    """Черновик по умолчанию: только служебные строки, ключи и реплики вырезаны, версии на месте."""
+    log = _bug_log(tmp_path)
+    (tmp_path / "VERSION").write_text("v0.7.10\n", encoding="utf-8")
+    monkeypatch.setattr(ss, "station_version", lambda repo=None: "station-test")
+
+    title, body = ss.bug_draft(log, tmp_path)
+
+    assert title.startswith("Колонка: ")
+    assert "v0.7.10" in body and "station-test" in body
+    assert "sk-supersecretkeyvalue1" not in body and "DEEPSEEK_API_KEY=***" in body
+    assert "открой дверь пожалуйста" not in body and "старая реплика" not in body
+    assert "123456789" not in body  # строка с chat_id не служебная — вырезана целиком
+    assert "🧭" in body and "ядро:" in body and "кольцо кадр" not in body
+    assert "«…»" in body
+
+
+def test_bug_draft_full_log_still_masked(tmp_path, monkeypatch):
+    """Полный лог — только по явной галочке, и всё равно после маскировки."""
+    log = _bug_log(tmp_path)
+    monkeypatch.setattr(ss, "station_version", lambda repo=None: "x")
+
+    _, body = ss.bug_draft(log, tmp_path, everything=True)
+
+    assert "кольцо кадр" in body
+    assert "sk-supersecretkeyvalue1" not in body and "открой дверь пожалуйста" not in body
+    assert "123456789" not in body
+
+
+def test_file_bug_posts_and_returns_link(monkeypatch):
+    """Подтверждение создаёт issue и возвращает номер со ссылкой."""
+    sent = {}
+
+    def fake_post(url, token, payload, timeout=20):
+        sent["url"], sent["token"], sent["payload"] = url, token, payload
+        return 201, {"number": 31, "html_url": "https://github.com/krikz/rob_box_station/issues/31"}
+
+    monkeypatch.setattr("station_report._post", fake_post)
+    note, url = ss.file_bug("ghp_exampletokenvalue1234567890", "Колонка: тест", "тело")
+
+    assert sent["url"].endswith("/repos/krikz/rob_box_station/issues")
+    assert sent["payload"]["title"] == "Колонка: тест"
+    assert note == "Завёл баг: issue номер 31"
+    assert url == "https://github.com/krikz/rob_box_station/issues/31"
+
+
+def test_file_bug_shows_error_instead_of_swallowing(monkeypatch):
+    """Нет токена, сеть, 4xx — честная ошибка, не тишина."""
+    note, url = ss.file_bug("", "t", "b")
+    assert "нет токена" in note and url == ""
+
+    def boom(url, token, payload, timeout=20):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr("station_report._post", boom)
+    note, url = ss.file_bug("token", "t", "b")
+    assert note.startswith("не смог завести баг") and "TimeoutError" in note and url == ""
+
+    monkeypatch.setattr("station_report._post", lambda *a, **k: (401, {}))
+    note, url = ss.file_bug("token", "t", "b")
+    assert "401" in note and url == ""
+
+
+def test_file_bug_masks_what_it_sends(monkeypatch):
+    """Даже правка текста руками не протащит ключ или реплику в issue."""
+    sent = {}
+    monkeypatch.setattr("station_report._post",
+                        lambda url, token, payload, timeout=20: sent.update(payload) or (201, {"number": 1}))
+
+    ss.file_bug("token", "Колонка: ключ", "DEEPSEEK_API_KEY=sk-leakvalue1234567890\nчеловек: «секретная реплика»")
+
+    assert "sk-leakvalue1234567890" not in sent["body"] and "секретная реплика" not in sent["body"]
+
+
+def test_bug_page_preview_publishes_nothing(tmp_path):
+    """GET /bug собирает черновик и не трогает сеть."""
+    import asyncio
+
+    log = _bug_log(tmp_path)
+    server = ss.SettingsServer(tmp_path / "s.json", tmp_path / ".env", ss.Auth(), lambda *a: None, lambda *a: None,
+                               base=tmp_path, log_path=log, token=lambda: "should-not-be-used")
+
+    status, page = asyncio.run(server._handle("GET", "/bug", b""))
+
+    assert status == "200 OK" and "Завести баг" in page and 'method="post"' in page
+    assert "sk-supersecretkeyvalue1" not in page and "should-not-be-used" not in page
+
+
+def test_bug_page_shows_api_error(tmp_path, monkeypatch):
+    """POST /bug: ошибка GitHub показывается на странице, а не глотается."""
+    import asyncio
+
+    monkeypatch.setattr("station_report._post", lambda *a, **k: (403, {}))
+    server = ss.SettingsServer(tmp_path / "s.json", tmp_path / ".env", ss.Auth(), lambda *a: None, lambda *a: None,
+                               base=tmp_path, log_path=_bug_log(tmp_path), token=lambda: "tok")
+
+    status, page = asyncio.run(server._handle("POST", "/bug", "title=Колонка:+тест&body=текст+лога".encode()))
+
+    assert status == "200 OK"
+    assert "не смог завести баг" in page and "403" in page
