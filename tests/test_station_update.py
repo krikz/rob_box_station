@@ -226,3 +226,44 @@ def test_boot_recovers_old_core_if_interrupted_between_renames(tmp_path, monkeyp
     assert (tmp_path / "core/old-only").read_bytes() == b"old"
     assert env.is_file()
     assert not requests
+
+
+def test_same_version_is_not_newer():
+    """Совпала — не катим. Старше тоже не катим. Новее — катим."""
+    assert su.newer_than("v0.2.5", "v0.2.5") is False
+    assert su.newer_than("v0.2.4", "v0.2.5") is False
+    assert su.newer_than("v0.2.5", "v0.2.4") is True
+    assert su.newer_than("v0.3.0", "v0.2.9") is True
+    assert su.newer_than("без версии", "v0.2.4") is False
+    assert su.newer_than("v0.2.5", "без версии") is False
+
+
+def test_install_phrase_comes_from_result():
+    """Фраза — из того, что вернула установка. Пусто — отказ, не выдуманный успех."""
+    placed = "Обновляюсь до v0.2.5, через минуту вернусь."
+    no_room = "Не хватает места для обновления: нужно 3 мегабайт, свободно 1."
+    assert su.install_phrase(placed) == placed
+    assert su.install_phrase("") == "Не смог скачать обновление, попробуй позже."
+    assert su.install_phrase(no_room) == no_room
+    assert su.should_restart(placed) is True
+    assert su.should_restart("") is False
+    assert su.should_restart(no_room) is False
+
+
+def test_offer_suffix_only_when_check_has_newer_tag():
+    assert su.offer_suffix("v0.2.5", "check") == " Скажи «Игорёк, обновись», чтобы поставить."
+    assert su.offer_suffix(None, "check") == ""
+    assert su.offer_suffix("v0.2.5", "install") == ""
+
+
+def test_latest_same_version_does_not_offer_install(tmp_path, monkeypatch):
+    """Опубликованный тег равен VERSION — latest не отдаёт тег, install звать не с чем."""
+    (tmp_path / "VERSION").write_text("v0.2.5\n", encoding="utf-8")
+    asset = {"name": "station-core.tar.gz", "state": "uploaded", "digest": "sha256:" + "ab" * 32}
+    releases = [{"tag_name": "v0.2.5", "assets": [asset]}, {"tag_name": "v0.2.4", "assets": [asset]}]
+    monkeypatch.setattr(su, "_get", lambda url, token, accept="": json.dumps(releases).encode())
+    monkeypatch.setattr(su.Updater, "notes", lambda self, tag: "не должны читать")
+    tag, phrase = su.Updater(tmp_path, lambda: "", lambda msg: None).latest()
+    assert tag is None
+    assert phrase == "Обновлений нет, у меня версия v0.2.5."
+    assert su.newer_than(tag or "", "v0.2.5") is False

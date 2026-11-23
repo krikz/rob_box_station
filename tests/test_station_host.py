@@ -337,8 +337,12 @@ def test_phone_tool_registered_and_dispatches(monkeypatch):
 
 
 class _Updater:
-    def __init__(self) -> None:
+    def __init__(self, current: str = "v0.1.13") -> None:
         self.installed = []
+        self._current = current
+
+    def current(self):
+        return self._current
 
     def latest(self):
         return "v9.9.9", "Есть новая версия v9.9.9, у меня v0.1.13. Что нового: кольцо."
@@ -363,8 +367,14 @@ class _Live:
 
 
 def _update(text, updater, monkeypatch):
+    import station_update as real_update
+
     fake = types.ModuleType("station_update")
     fake.update_command = lambda rest: "check" if "провер" in rest else ("install" if "обнов" in rest else "")
+    fake.newer_than = real_update.newer_than
+    fake.offer_suffix = real_update.offer_suffix
+    fake.install_phrase = real_update.install_phrase
+    fake.should_restart = real_update.should_restart
     monkeypatch.setitem(sys.modules, "station_update", fake)
     report = types.ModuleType("station_report")
     report.report_command = lambda rest: ("", "")
@@ -387,6 +397,19 @@ def test_update_without_check_tells_news_first(monkeypatch):
     updater = _Updater()
     said = _update("обновись", updater, monkeypatch)
     assert "Что нового" in said[0] and updater.installed == ["v9.9.9"]
+
+
+def test_update_same_version_does_not_install(monkeypatch):
+    """Версия совпала — latest не отдаёт тег, install не зовётся, фраза из результата проверки."""
+    updater = _Updater(current="v0.2.5")
+
+    def already():
+        return None, f"Обновлений нет, у меня версия {updater.current()}."
+
+    updater.latest = already
+    said = _update("обновись", updater, monkeypatch)
+    assert updater.installed == []
+    assert said == ["Обновлений нет, у меня версия v0.2.5."]
 
 
 class _Proc:
