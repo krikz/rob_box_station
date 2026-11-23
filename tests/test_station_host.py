@@ -1,12 +1,14 @@
 """Хост колонки: кольцо не залипает в «думаю», вейк своей моделью.
 
 Повтор на 429 и запасной провайдер STT — ``test_station_stt.py`` (цепочка ``station_stt``).
-08.11 баг на живой второй колонке: адресованный ход с пустой репликой (`ход 0.05 с: []`) оставлял кольцо в `think` навсегда: в очередь
-   озвучки ничего не попадало, `_play` не просыпался и `ring.idle()` не вызывался.
+08.11 баг на живой второй колонке: адресованный ход с пустой репликой (`ход 0.05 с: []`) оставлял кольцо
+в `think` навсегда: в очередь озвучки ничего не попадало, `_play` не просыпался и `ring.idle()` не вызывался.
 """
+
 import asyncio
-import types
+import hashlib
 import sys
+import types
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -141,12 +143,29 @@ def test_wordless_turn_arms_window_without_wake():
 
 #: Тулы движения, лица и камеры (ADR-0160 §8 К3) — хост колонки их не ставит.
 MOTION_FACE_CAMERA_TOOLS = (
-    "get_perception_context", "play_animation",
-    "people_list", "person_photo", "name_person", "find_similar", "merge_people",
-    "navigate_to_waypoint", "navigate_to_coordinates", "move_direction", "stop_navigation",
-    "get_current_pose", "list_waypoints", "save_waypoint", "delete_waypoint", "clear_waypoints",
-    "start_mapping", "continue_mapping", "finish_mapping", "optimize_map", "load_map",
-    "list_maps", "delete_map",
+    "get_perception_context",
+    "play_animation",
+    "people_list",
+    "person_photo",
+    "name_person",
+    "find_similar",
+    "merge_people",
+    "navigate_to_waypoint",
+    "navigate_to_coordinates",
+    "move_direction",
+    "stop_navigation",
+    "get_current_pose",
+    "list_waypoints",
+    "save_waypoint",
+    "delete_waypoint",
+    "clear_waypoints",
+    "start_mapping",
+    "continue_mapping",
+    "finish_mapping",
+    "optimize_map",
+    "load_map",
+    "list_maps",
+    "delete_map",
 )
 
 
@@ -200,8 +219,12 @@ def _fake_core(monkeypatch):
     kn.TOOLS_ALWAYS = ("speak_text", "get_current_time")
     core, dialog = types.ModuleType("rob_box_core"), types.ModuleType("rob_box_dialog")
     core.tool_catalog, dialog.knowledge = tc, kn
-    for name, mod in (("rob_box_core", core), ("rob_box_core.tool_catalog", tc), ("rob_box_dialog", dialog),
-                      ("rob_box_dialog.knowledge", kn)):
+    for name, mod in (
+        ("rob_box_core", core),
+        ("rob_box_core.tool_catalog", tc),
+        ("rob_box_dialog", dialog),
+        ("rob_box_dialog.knowledge", kn),
+    ):
         monkeypatch.setitem(sys.modules, name, mod)
     return tc, kn
 
@@ -228,8 +251,7 @@ def test_report_tool_handler_files_issue(monkeypatch):
     stand = types.SimpleNamespace(tools=types.SimpleNamespace())
     monkeypatch.delenv("RBX_REPORT_DRY", raising=False)
     assert sh.install_report_tool(stand, _Reporter())
-    ok, data = stand.tools._t_report_issue({"complaint": "нет логов на странице", "title": "логи",
-                                            "with_log": False})
+    ok, data = stand.tools._t_report_issue({"complaint": "нет логов на странице", "title": "логи", "with_log": False})
 
     assert ok and data["issue_number"] == 21
     assert calls == [("нет логов на странице", "логи", "", False)]
@@ -242,8 +264,10 @@ def test_first_heard_takes_first_ok_and_waits_past_failure():
         async def later(value, delay):
             await asyncio.sleep(delay)
             return value
-        return await sh.first_heard(asyncio.ensure_future(later(first, delay_first)),
-                                    asyncio.ensure_future(later(second, delay_second)))
+
+        return await sh.first_heard(
+            asyncio.ensure_future(later(first, delay_first)), asyncio.ensure_future(later(second, delay_second))
+        )
 
     slow_ok, fast_ok = st.Heard("цепочка", "minimax"), st.Heard("гонщик", "yandex")
     assert asyncio.run(run(slow_ok, fast_ok, 0.05, 0.0)).text == "гонщик"
@@ -394,6 +418,88 @@ class _Proc:
         return b"", b""
 
 
+def test_chimera_bird_plays_one_clip_and_stop_cuts_it(monkeypatch, tmp_path):
+    """«Игорёк, изобрази птицу Химерой» играет ровно один клип; штатная остановка глушит его проигрыватель."""
+    import station_chimera
+
+    repo = Path(__file__).resolve().parents[1]
+    monkeypatch.setattr(sh, "BASE", repo)
+    spawned = []
+
+    class _Player:
+        def __init__(self):
+            self.signals, self.alive, self.pcm = [], True, b""
+
+        def poll(self):
+            return None if self.alive else 0
+
+        def terminate(self):
+            self.signals.append("TERM")
+            self.alive = False
+
+        def kill(self):
+            self.signals.append("KILL")
+            self.alive = False
+
+        def wait(self, timeout=None):
+            return 0
+
+        def communicate(self, data=None):
+            self.pcm = data or b""
+            return b"", b""
+
+    def popen(cmd, **kw):
+        player = _Player()
+        player.cmd = cmd
+        spawned.append(player)
+        return player
+
+    monkeypatch.setattr(sh.subprocess, "Popen", popen)
+    fake_update = types.ModuleType("station_update")
+    fake_update.update_command = lambda rest: ""
+    monkeypatch.setitem(sys.modules, "station_update", fake_update)
+    fake_report = types.ModuleType("station_report")
+    fake_report.report_command = lambda rest: ("", "")
+    monkeypatch.setitem(sys.modules, "station_report", fake_report)
+
+    voice = types.SimpleNamespace(proc=None, cut=False)
+    voice.play_wav = sh.Voice.play_wav.__get__(voice, type(voice))
+    voice.stop = sh.Voice.stop.__get__(voice, type(voice))
+    live = types.SimpleNamespace(said=[], played=[], _ring=None, _voice=voice, _mic=None, _t1=0.0)
+    live.earcon = lambda: None
+    live.speak = lambda text, key="": live.said.append(text)
+
+    async def drain():
+        return None
+
+    async def play_clip(path):
+        live.played.append(path.name)
+        await voice.play_wav(path, None)
+
+    live.drain, live.play_clip = drain, play_clip
+
+    asyncio.run(sh.code_command("Игорёк, изобрази птицу Химерой", live, None, None, None, None))
+
+    assert live.played == ["bird.wav"]
+    assert len(spawned) == 1
+    assert spawned[0].cmd[spawned[0].cmd.index("-r") + 1] == "16000"
+    import wave
+
+    expected = station_chimera.clip_for(repo, "изобрази птицу химерой")[0]
+    with wave.open(str(expected)) as wav:
+        frames = wav.readframes(wav.getnframes())
+    assert hashlib.sha256(spawned[0].pcm).hexdigest() == hashlib.sha256(frames).hexdigest()
+    assert not live.said
+
+    # Штатная остановка — LiveOut.stop: чистит очередь и зовёт Voice.stop, а тот глушит текущий aplay.
+    queue = asyncio.Queue()
+    queue.put_nowait(("ещё", None, ""))
+    live_out = types.SimpleNamespace(_queue=queue, _voice=voice)
+    sh.LiveOut.stop(live_out)
+    assert queue.empty()
+    assert voice.proc is spawned[0] and spawned[0].signals == ["TERM"] and not spawned[0].alive
+
+
 def test_stop_player_is_soft_first():
     """09.11 корень глухоты: SIGKILL aplay ломал общий микшер dmix, следующий звук висел. Сначала SIGTERM."""
     soft = _Proc()
@@ -516,16 +622,21 @@ def test_button_hold_files_bug_with_log_tail(tmp_path, monkeypatch):
     import station_setup as sh_setup  # noqa: E402
 
     log = tmp_path / "station.log"
-    log.write_text("18:49:12 \U0001f50a синтез: «секретная реплика»\n18:49:13 \U0001f9ed [turn-v2] отказ\n",
-                   encoding="utf-8")
+    log.write_text(
+        "18:49:12 \U0001f50a синтез: «секретная реплика»\n18:49:13 \U0001f9ed [turn-v2] отказ\n", encoding="utf-8"
+    )
     (tmp_path / "VERSION").write_text("v0.7.10\n", encoding="utf-8")
     monkeypatch.setattr(sh, "BASE", tmp_path)
     sent = {}
     monkeypatch.setattr(sh_setup, "LOG_PATH", log)
     monkeypatch.setattr(sh_setup, "station_version", lambda repo=None: "station-test")
     import station_report
-    monkeypatch.setattr(station_report, "_post",
-                        lambda url, token, payload, timeout=20: sent.update(payload=payload) or (201, {"number": 7}))
+
+    monkeypatch.setattr(
+        station_report,
+        "_post",
+        lambda url, token, payload, timeout=20: sent.update(payload=payload) or (201, {"number": 7}),
+    )
     monkeypatch.setenv("GH_ISSUE_TOKEN", "tok")
 
     asyncio.run(sh.file_bug_from_button(sh.KEY_ACTION))
