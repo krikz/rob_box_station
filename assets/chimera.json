@@ -1,0 +1,43 @@
+{
+  "name": "chimera",
+  "release": "v0.2.5",
+  "version": "c1-0.2.0",
+  "rate": 16000,
+  "channels": 1,
+  "sample_width": 2,
+  "commands": {
+    "изобрази птицу химерой": "bird.wav"
+  },
+  "files": {
+    "bird.wav": {
+      "sha256": "67f4305e002964924807a18b9e7e9d5513e43ddbc5ce8428d12f94220595a372",
+      "rate": 16000,
+      "license": "MIT",
+      "source": "ресемпл 48 кГц рендера #5014, пакет #5029 c1-0.2.0"
+    },
+    "seal.wav": {
+      "sha256": "50e23c14ae65a162c7a86bddcc8c48f5fe5eb1d4bbe88159e0884dbc38b5a494",
+      "rate": 16000,
+      "license": "MIT",
+      "source": "ресемпл 48 кГц рендера #5014, пакет #5029 c1-0.2.0"
+    },
+    "elephant.wav": {
+      "sha256": "cf905e2b167cfe41b50047852b1670873c18a72bfae1a97fcad859160ceec70c",
+      "rate": 16000,
+      "license": "MIT",
+      "source": "ресемпл 48 кГц рендера #5014, пакет #5029 c1-0.2.0"
+    },
+    "alligator.wav": {
+      "sha256": "5128bcabb9508fb113de33a52546fbdacb2e1ad2b5a49a6d006e16bc8b5667b8",
+      "rate": 16000,
+      "license": "MIT",
+      "source": "ресемпл 48 кГц рендера #5014, пакет #5029 c1-0.2.0"
+    },
+    "growl.wav": {
+      "sha256": "910faa03c4ccdff65d31398606a2be1262ac55f2a515d8cdd089c02499f433ea",
+      "rate": 16000,
+      "license": "MIT",
+      "source": "ресемпл 48 кГц рендера #5014, пакет #5029 c1-0.2.0"
+    }
+  }
+}

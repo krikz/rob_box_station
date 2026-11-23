@@ -257,12 +257,34 @@ class Voice:
             raise SystemExit("нет ключа STT (MINIMAX_API_KEY или YANDEX_API_KEY)")
         log(f"STT: {' → '.join(self.stt.names())}, хедж {self.stt.hedge_s:.1f} с")
         self.limited = False
-        self.proc: subprocess.Popen | None = None  # текущий aplay речи — его глушит кнопка
+        self.proc: subprocess.Popen | None = None  # текущий aplay речи и клипа — его глушит кнопка
         self.cut = False
 
     async def synth_pcm(self, text: str, voice: str | None = None) -> bytes:
         """Синтез целиком в PCM 24 кГц (офлайн-фразы заранее)."""
         return await self.tts.synthesize_bytes(text, voice or None, format=TTS_FORMAT)
+
+    async def play_wav(self, path: Path, mic: Mic | None = None, on_sound=None) -> None:
+        """Локальный WAV 16 кГц моно в тот же ``aplay``, что и речь: остановка глушит его через ``self.proc``."""
+        with wave.open(str(path)) as wav:
+            rate, channels, width = wav.getframerate(), wav.getnchannels(), wav.getsampwidth()
+            frames = wav.getnframes()
+            pcm = wav.readframes(frames)
+        if channels != 1 or width != 2:
+            raise ValueError(f"{path.name}: ждали моно 16 бит, пришло {channels}×{width * 8}")
+        self.cut = False
+        if mic:
+            mic.muted = True
+        try:
+            if on_sound:
+                on_sound()
+            self.proc = subprocess.Popen(aplay_cmd(rate), stdin=subprocess.PIPE)
+            await wait_player(self.proc, pcm, frames / rate + PLAY_SLACK_S, path.name)
+        finally:
+            if mic:
+                await asyncio.sleep(0.3)
+                mic.flush()
+                mic.muted = False
 
     async def play_pcm(self, pcm: bytes, mic: Mic | None = None, on_sound=None) -> None:
         """Готовый звук (офлайн-фраза, тон) в динамик, микрофон заглушён на время — свой звук не уходит в STT."""
@@ -1034,6 +1056,25 @@ async def code_command(text: str, live: "LiveOut", updater, reporter, bt, mic: M
             updater.arm_watchdog()  # окно сторожа начинается здесь: озвучка уже позади (08.11: откат)
             restart_self(mic, "обновление", announce=False)
         return True
+    import station_chimera  # noqa: PLC0415
+
+    if station_chimera.chimera_command(rest):  # «изобрази птицу Химерой» — один локальный клип, не модель
+        live.earcon()
+        try:
+            found = station_chimera.clip_for(BASE, rest)
+        except ValueError as exc:
+            log(f"CHIMERA не играет: {exc}")
+            live.speak("Этого звука у меня нет.")
+            await live.drain()
+            return True
+        if found is None:  # фраза из грамматики, но не из установленного профиля
+            live.speak("Этого звука у меня нет.")
+            await live.drain()
+            return True
+        path, _meta = found
+        await live.play_clip(path)
+        await live.drain()
+        return True
     action, complaint = station_report.report_command(rest)
     if action:  # жалоба по фразе: быстрее и надёжнее модели; иначе — тул модели report_issue
         live.earcon()
@@ -1262,7 +1303,7 @@ class LiveOut:
         import functools  # noqa: PLC0415
 
         self._voice, self._mic, self._ring = voice, mic, ring
-        self._queue: asyncio.Queue[tuple[str, str | None, str]] = asyncio.Queue()  # (текст, голос, офлайн-ключ)
+        self._queue: asyncio.Queue = asyncio.Queue()  # (текст, голос, офлайн-ключ | Path клипа)
         self._stand = stand
         self._t1 = 0.0
         self.offline = station_offline.OfflinePhrases(OFFLINE_DIR, log)
@@ -1334,17 +1375,21 @@ class LiveOut:
             started: list = []
             mark = lambda: started.append(time.time())  # noqa: E731
             try:
-                key = key or self.offline.key_for(line)
-                cached = self.offline.pcm(key) if key else None
-                if key == "tone":
-                    await self._voice.play_pcm(station_offline.tone(line), self._mic, mark)
-                elif cached:  # заранее синтезированная — сразу, без сети
-                    await self._voice.play_pcm(cached, self._mic, mark)
-                    log(f"🔊 офлайн «{key}», от конца фразы до звука {self._gap(started)} с: «{line}»")
+                if isinstance(key, Path):  # локальный клип: тот же проигрыватель, тот же stop
+                    await self._voice.play_wav(key, self._mic, mark)
+                    log(f"🔊 клип {key.name}, от конца фразы до звука {self._gap(started)} с")
                 else:
-                    synth = await self._voice.say(line, self._mic, on_sound=mark, voice=voice_id)
-                    log(f"🔊 синтез до звука {synth:.2f} с, от конца фразы до звука {self._gap(started)} с, "
-                        f"голос {voice_id or '—'}: «{line}»")
+                    key = key or self.offline.key_for(line)
+                    cached = self.offline.pcm(key) if key else None
+                    if key == "tone":
+                        await self._voice.play_pcm(station_offline.tone(line), self._mic, mark)
+                    elif cached:  # заранее синтезированная — сразу, без сети
+                        await self._voice.play_pcm(cached, self._mic, mark)
+                        log(f"🔊 офлайн «{key}», от конца фразы до звука {self._gap(started)} с: «{line}»")
+                    else:
+                        synth = await self._voice.say(line, self._mic, on_sound=mark, voice=voice_id)
+                        log(f"🔊 синтез до звука {synth:.2f} с, от конца фразы до звука {self._gap(started)} с, "
+                            f"голос {voice_id or '—'}: «{line}»")
             except Exception as exc:  # noqa: BLE001
                 log(f"реплика не прозвучала ({type(exc).__name__}): «{line}»")
                 if not started:  # синтез упал до звука — молчать нельзя: офлайн-фраза или тон ошибки
@@ -1366,6 +1411,11 @@ class LiveOut:
             log("🔊 синтез не ответил — сыграл запасной звук")
         except Exception as exc:  # noqa: BLE001
             log(f"запасной звук не сыграл: {type(exc).__name__}")
+
+    def play_clip(self, path: Path):
+        """Один локальный клип в очередь динамика. Владелец проигрывателя — ``Voice``: ``stop`` глушит и его."""
+        self._queue.put_nowait((path.name, None, path))
+        return self._queue.join()
 
     def speak(self, text: str, key: str = "") -> None:
         """Фраза кода (не хода модели) — в ту же очередь динамика; ``key`` — офлайн-фраза, если она уже есть."""
