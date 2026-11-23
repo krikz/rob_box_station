@@ -101,20 +101,28 @@ def wav_bytes(pcm: bytes, rate: int = RATE) -> bytes:
 
 class Mic:
     """Кадры 30 мс, 16 кГц моно, канал 0 ``multi_capture``. Читает отдельный поток в очередь: пока ход ждёт STT или LLM,
-    ``arecord`` не переполняется (overrun). ``muted`` — кадры выбрасываются (полудуплекс)."""
+    ``arecord`` не переполняется (overrun). ``muted`` — кадры выбрасываются (полудуплекс).
+
+    ``released`` — микрофон отпущен (#5027): свой ``arecord`` получает SIGTERM и fd устройства закрыт, кадры не
+    читаются. Включается только явным ``RBX_MIC_FIFO`` (по умолчанию выключено — живой хост не меняется)."""
 
     def __init__(self) -> None:
         # plughw:0,1 — PDM-микрофоны; ALSA сама отдаёт 16 кГц моно (канал 0). Резать 6 каналов и ресемплить на Питоне
         # нельзя: на A53 поток микрофона под GIL растягивал ход консоли с 3,6 до 22 с (замер 07.11).
-        self.proc = subprocess.Popen(["arecord", "-q", "-D", MIC_DEVICE, "-f", "S16_LE", "-r", str(RATE), "-c", "1",
-                                      "-t", "raw"], stdout=subprocess.PIPE, bufsize=0)
+        self.proc = self._open()
         self.state = None
         self._muted, self.muted_since = False, 0.0
         self.user_muted = False  # кнопка «микрофон выкл»: кадры не идут в VAD, пока не включат
         #: Звонок по телефону: кадры уходят собеседнику, а не в VAD (вейк в разговоре не слушаем).
         self.tap = None
+        self._released = False  # микрофон отпущен: arecord остановлен, fd устройства закрыт (#5027)
         self.q: "queue.Queue[bytes]" = queue.Queue(maxsize=int(30 / FRAME_S))  # 30 с запаса
         threading.Thread(target=self._pump, daemon=True).start()
+
+    def _open(self) -> "subprocess.Popen":
+        """Свой ``arecord`` на ``MIC_DEVICE``. Тот же вызов, что раньше был прямо в ``__init__``."""
+        return subprocess.Popen(["arecord", "-q", "-D", MIC_DEVICE, "-f", "S16_LE", "-r", str(RATE), "-c", "1",
+                                 "-t", "raw"], stdout=subprocess.PIPE, bufsize=0)
 
     @property
     def muted(self) -> bool:
@@ -138,17 +146,23 @@ class Mic:
 
     def _pump(self) -> None:
         while True:
+            if self._released:  # микрофон отпущен: своего arecord нет, читать нечего (#5027)
+                time.sleep(FRAME_S)
+                continue
             fr = self._read()
             tap = self.tap
             if tap is not None:
                 tap(fr)
                 continue
-            if self.muted or self.user_muted:
-                continue
+            if self._released or self.muted or self.user_muted:
+                continue  # повторная проверка: флаг мог подняться, пока кадр читался
             try:
                 self.q.put_nowait(fr)
             except queue.Full:
-                self.q.get_nowait()
+                try:
+                    self.q.get_nowait()
+                except queue.Empty:
+                    pass
                 self.q.put_nowait(fr)
 
     def flush(self) -> None:
@@ -157,6 +171,41 @@ class Mic:
 
     def frame(self) -> bytes:
         return self.q.get()
+
+    @property
+    def released(self) -> bool:
+        """Микрофон отпущен: свой ``arecord`` остановлен, устройство свободно (#5027)."""
+        return self._released
+
+    @released.setter
+    def released(self, value: bool) -> None:
+        """Отпустить или вернуть микрофон. Без ``RBX_MIC_FIFO`` — отказ: живой хост так не трогаем."""
+        if not mic_fifo_path():
+            raise RuntimeError("отпустить микрофон можно только с явным RBX_MIC_FIFO")
+        want = bool(value)
+        if want == self._released:
+            return
+        if want:
+            self._stop()
+            self._released = True
+            self.flush()
+        else:
+            self.proc = self._open()  # тот же Popen, что в __init__
+            self._released = False
+
+    def _stop(self) -> None:
+        """SIGTERM своего ``arecord`` и закрытие его stdout: fd устройства отпускается."""
+        proc = self.proc
+        if proc is None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        if proc.stdout is not None:
+            proc.stdout.close()
+        self.proc = None
 
 
 class Vad:
@@ -1103,12 +1152,110 @@ async def code_command(text: str, live: "LiveOut", updater, reporter, bt, mic: M
 #: Микрофон заглушён «на время речи» дольше этого — что-то зависло: колонка снова слушает.
 DEAF_MAX_S = float(os.environ.get("RBX_DEAF_MAX_S", "60"))
 
+#: Инъекция фразы текстом (#5027): путь к fifo в /tmp. Пусто — выключено, живой хост не меняется.
+#: Читается на каждом заходе в цикл, а не на импорте: тесты и хост задают его окружением.
+MIC_FIFO_MAX = 300  # фраза длиннее — не фраза, а мусор в fifo; отбрасываем
+
+
+def mic_fifo_path() -> "Path | None":
+    """Путь fifo из ``RBX_MIC_FIFO`` или ``None``. Только путь внутри ``/tmp``: иначе переменная игнорируется."""
+    raw = os.environ.get("RBX_MIC_FIFO", "").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    if path.parent != Path("/tmp"):
+        log(f"⚠ RBX_MIC_FIFO={raw}: не в /tmp — игнорирую")
+        return None
+    return path
+
+
+def open_mic_fifo() -> "int | None":
+    """Fifo для инъекции фразы. ``None`` — вход выключен. Создаётся только при явном ``RBX_MIC_FIFO`` в ``/tmp``."""
+    path = mic_fifo_path()
+    if path is None:
+        return None
+    if path.is_dir() or path.is_symlink():
+        log(f"⚠ RBX_MIC_FIFO={path}: каталог или ссылка — не открываю")
+        return None
+    if not path.exists():
+        os.mkfifo(path, 0o600)
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    log(f"🎤 fifo фраз: {path}")
+    return fd
+
+
+#: Недописанный хвост строки по fd: между заходами в цикл строка ещё может дописываться.
+_FIFO_TAIL: "dict[int, bytes]" = {}
+
+
+def read_mic_fifo(fd: int) -> str:
+    """Одна строка из fifo — одна фраза. Пусто, оборвано или длиннее ``MIC_FIFO_MAX`` — пустая строка.
+
+    Читает по байту до перевода строки, хвост без перевода строки помнит до следующего захода: иначе
+    недописанная фраза терялась бы. Строка длиннее предела вычитывается до конца и отбрасывается целиком."""
+    buf = _FIFO_TAIL.pop(fd, b"")
+    while b"\n" not in buf:
+        try:
+            chunk = os.read(fd, 1)
+        except BlockingIOError:
+            _FIFO_TAIL[fd] = buf  # строка ещё не дописана — вернёмся за ней на следующем заходе
+            return ""
+        if not chunk:
+            return ""  # писатель закрыл fifo на полустроке — хвост забываем
+        buf += chunk
+        if len(buf) > MIC_FIFO_MAX + 1:  # мусор, а не фраза: дочитать до конца строки и выбросить
+            while not buf.endswith(b"\n"):
+                try:
+                    more = os.read(fd, 1)
+                except BlockingIOError:
+                    return ""
+                if not more:
+                    return ""
+                buf = more
+            return ""
+    return buf.split(b"\n", 1)[0].decode("utf-8", "replace").strip()
+
+
+async def fifo_phrase(fd, buttons, live, updater, reporter, bt, mic, hfp, stand, chat) -> bool:
+    """Фраза из fifo — та же ветка, что ``heard.text`` после STT: адрес, код-команда, ход. Пусто — ``False``.
+
+    Вынесено из цикла, чтобы ветку можно было проверить без живого микрофона и без всего, что ``serve``
+    поднимает до цикла (#5027)."""
+    if fd is None:
+        return False
+    phrase = read_mic_fifo(fd)
+    if not phrase:
+        return False
+    text = buttons.address(phrase)
+    log(f"🎤 fifo: «{text}»")
+    if await code_command(text, live, updater, reporter, bt, mic, hfp):
+        return True
+    try:
+        result = await asyncio.wait_for(stand.hear(text, chat.CONSOLE_VOICE, source=chat.SOURCE_VOICE),
+                                        TURN_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        log(f"ход дольше {TURN_TIMEOUT_S:.0f} с — прерван")
+        await live.trouble("llm_fail" if await asyncio.to_thread(net_ok) else "no_net")
+        return True
+    except Exception as exc:  # noqa: BLE001 — сбой хода не роняет хост
+        log(f"ход упал: {type(exc).__name__}: {str(exc)[:200]}")
+        await live.trouble("llm_fail" if await asyncio.to_thread(net_ok) else "no_net")
+        return True
+    if not result.addressed:
+        log(f"… не адресовано ({result.reason})")
+        return True
+    log(f"ход: {result.said}")
+    await live.drain()
+    return True
+
 
 async def deaf_watchdog(mic: Mic, live: "LiveOut", in_call=lambda: False, every: float = 5.0) -> None:
     """Сторож глухоты: 09.11 колонка 35 мин не слышала ничего — висел ``aplay``, а микрофон ждал конца речи.
     Длиннее ``DEAF_MAX_S`` своей речи не бывает (анекдот — 20 с): обрываем звук и снимаем заглушку."""
     while True:
         await asyncio.sleep(every)
+        if getattr(mic, "released", False):  # отпущен нарочно (#5027) — не зависшая речь, заглушку не снимаем
+            continue
         if mic.muted and not in_call() and time.time() - mic.muted_since > DEAF_MAX_S:
             log(f"⚠ микрофон заглушён {time.time() - mic.muted_since:.0f} с — что-то зависло, снова слушаю")
             live.stop()
@@ -1201,10 +1348,13 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
     Keys(asyncio.get_running_loop(), buttons.on_key, buttons.on_hold, setup.BUG_HOLD_S)
     await start_setup(stand, mic, ring, buttons)
     asyncio.ensure_future(deaf_watchdog(mic, live, lambda: bool(hfp and hfp.in_call)))
+    fifo = open_mic_fifo()  # None, пока нет явного RBX_MIC_FIFO: живой хост не меняется (#5027)
     announce_start(live, version)
     live.refresh_offline(delay=8.0)  # пока сеть есть — досинтезировать фразы на случай, когда её не будет
     try:
         while True:
+            if await fifo_phrase(fifo, buttons, live, updater, reporter, bt, mic, hfp, stand, chat):
+                continue  # фраза из fifo ушла в ту же ветку, что heard.text после STT (#5027)
             pcm = await asyncio.to_thread(vad.utterance, mic)
             t1 = time.time()
             live.begin(t1)
@@ -1286,7 +1436,10 @@ async def serve(voice: Voice, args: argparse.Namespace) -> None:
     finally:
         live.close()
         ring.idle()  # что бы ни случилось в цикле, кольцо не должно остаться в «думаю»/«говорю»
-        mic.proc.kill()
+        if fifo is not None:
+            os.close(fifo)
+        if mic.proc is not None:  # отпущенный микрофон уже закрыт своим SIGTERM (#5027)
+            mic.proc.kill()
         stand.close()
 
 
