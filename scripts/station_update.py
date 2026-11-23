@@ -182,12 +182,9 @@ class Updater:
         if not names:
             return None, "Опубликованных обновлений с ядром пока нет."
 
-        def version_key(tag: str) -> list[int]:
-            return [int(part) if part.isdigit() else 0 for part in tag[1:].split(".")]
-
         newest = max(names, key=version_key)
         current = self.current()
-        if version_key(newest) <= version_key(current):
+        if not newer_than(newest, current):
             return None, f"Обновлений нет, у меня версия {current}."
         notes = self.notes(newest)
         return newest, (f"Есть новая версия {newest}, у меня {self.current()}."
@@ -256,6 +253,33 @@ class Updater:
                   "/etc/init.d/S99zzzrbxhost restart")
         subprocess.Popen(["setsid", "sh", "-c", script], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def version_key(tag: str) -> list[int]:
+    """Числа тега ``vX.Y.Z`` для сравнения. Нечисловая часть — ноль, не догадка о порядке."""
+    return [int(part) if part.isdigit() else 0 for part in tag[1:].split(".")]
+
+
+def newer_than(candidate: str, current: str) -> bool:
+    """``True``, только если опубликованный тег новее установленного. Совпал или старше — не катим."""
+    if not candidate.startswith("v") or not current.startswith("v"):
+        return False
+    return version_key(candidate) > version_key(current)
+
+
+def offer_suffix(tag: "Optional[str]", command: str) -> str:
+    """Хвост фразы «проверь»: код предлагает поставить, только если тег новее. Иначе пусто."""
+    return " Скажи «Игорёк, обновись», чтобы поставить." if tag and command == "check" else ""
+
+
+def install_phrase(installed: str) -> str:
+    """Фраза после попытки поставить. Пустой результат установки — отказ, не «обновился»."""
+    return installed or "Не смог скачать обновление, попробуй позже."
+
+
+def should_restart(installed: str) -> bool:
+    """Перезапуск только если установка сама сказала, что поставила. Отказ и пусто — хост живёт дальше."""
+    return installed.startswith("Обновляюсь")
 
 
 def update_command(text: str) -> str:

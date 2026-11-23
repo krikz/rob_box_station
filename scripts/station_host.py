@@ -1041,18 +1041,19 @@ async def code_command(text: str, live: "LiveOut", updater, reporter, bt, mic: M
         # Сводку «что нового» по одной версии — один раз (Шифу 09.11: «проверь» зачитал, «обновись» — то же самое
         # ещё раз, «это очень бесит»). «Проверь» — читает всегда и запоминает; «обновись» без проверки — сначала
         # расскажет, что ставит; «обновись» после проверки этой же версии — ставит молча.
+        # Катить или нет решает latest(): совпавшая версия — tag None, install не зовётся.
         told = getattr(updater, "rbx_told", ("", 0.0))
         heard_already = bool(tag) and told[0] == tag and time.time() - told[1] < UPDATE_TOLD_S
         if command == "check" or not tag or not heard_already:
-            live.speak(phrase + (" Скажи «Игорёк, обновись», чтобы поставить." if tag and command == "check"
-                                 else ""))
+            live.speak(phrase + station_update.offer_suffix(tag, command))
             if tag:
                 updater.rbx_told = (tag, time.time())
-        done = await asyncio.to_thread(updater.install, tag) if tag and command == "install" else ""
-        if tag and command == "install":
-            live.speak(done or "Не смог скачать обновление, попробуй позже.")
+        installed = ""
+        if station_update.newer_than(tag or "", updater.current()) and command == "install":
+            installed = await asyncio.to_thread(updater.install, tag)
+            live.speak(station_update.install_phrase(installed))
         await live.drain()
-        if done.startswith("Обновляюсь"):
+        if station_update.should_restart(installed):
             updater.arm_watchdog()  # окно сторожа начинается здесь: озвучка уже позади (08.11: откат)
             restart_self(mic, "обновление", announce=False)
         return True
